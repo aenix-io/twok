@@ -209,7 +209,9 @@ Two etcd bugs matter for the takeover and the rejoin, and both are avoided or fi
 | `commit-tail` | `true` | mark the whole log as committed before `--force-new-cluster` |
 | `metrics-listen` | empty | address for Prometheus metrics |
 
-twok reads the etcd arguments it is given after `--`, takes the member name, the data directory, the client and peer URLs and the TLS files from them, and passes everything through to etcd. It changes only `--initial-cluster`, `--initial-cluster-state` and `--force-new-cluster`, and only during a takeover or a rejoin.
+Every setting is a flag `--twok-<name>` on the etcd command line, or `--<name>` after `twok run`, with the environment variable `TWOK_<NAME>` as a fallback; a flag wins over the variable.
+
+twok reads the etcd arguments it is given, takes the member name, the data directory, the client and peer URLs and the TLS files from them, and passes everything through to etcd. It changes only `--initial-cluster`, `--initial-cluster-state` and `--force-new-cluster`, and only during a takeover or a rejoin.
 
 ## Arbiter backends
 
@@ -250,11 +252,30 @@ An administrator who runs `--force-new-cluster` by hand must also claim the gene
 
 ## Deployment
 
-twok is one binary with the etcd binary next to it. The etcd process is a child of twok and is restarted by twok; etcd's image, version and arguments stay with whoever provides them.
+twok is a supervisor: the etcd process is its child, and twok restarts it when it has to.
+The etcd binary, its version and its arguments stay with whoever provides them.
 
-- **Kubernetes:** a StatefulSet of two Pods, each running `twok run -- etcd ...` with an init container that copies the etcd binary from the upstream image. `deploy/kubernetes/` holds the manifests, with the arbiter URL in a ConfigMap and the credentials in a Secret.
-- **etcd-operator:** not supported without changes to the operator. The operator builds the member Pods itself, with the etcd image as the only container and no way to add one or change the command. What the operator would need is listed in [docs/etcd-operator.md](etcd-operator.md).
-- **Talos:** not supported. Talos runs etcd as a system service from its own image, outside Kubernetes, and twok cannot supervise it. A two-node Talos control plane with an arbiter needs the same mechanism inside Talos, which is a question for Talos.
+The binary is delivered in an image that impersonates etcd.
+It is built from the upstream etcd image of a given version, with twok at `/usr/local/bin/etcd`, the real etcd next to it, and `etcdctl` and `etcdutl` untouched.
+Whoever launches etcd keeps launching `etcd <flags>`, and twok passes the flags through unchanged, except that it takes the `--twok-*` flags for itself and removes them.
+`--twok-mode=off` makes the image behave as plain etcd, so a rollback is a flag change, not an image change.
+The same binary also runs as `twok run --arbiter <url> -- etcd <flags>` when the command line can be chosen freely.
+
+What the supervisor owes to the systems that launch it:
+
+- argv and the environment go to etcd as they are, minus `--twok-*` and `TWOK_*`;
+- `SIGTERM` and `SIGINT` are forwarded, and twok exits with etcd's exit code when etcd exits for a reason twok does not handle;
+- `etcd --version` and the other informational invocations are handed straight to the real etcd;
+- twok writes nothing to stdout; its own logs go to stderr with a `twok` prefix;
+- an error in twok's own loop never stops etcd; the loop is restarted.
+
+| Platform | Image | twok settings | Status |
+| --- | --- | --- | --- |
+| Kubernetes, StatefulSet | `ghcr.io/aenix-io/twok-etcd:v<etcd version>` as the container image | `--twok-*` flags in the container command, `TWOK_*` as a fallback | tested, see [testing.md](testing.md) |
+| Talos | `cluster.etcd.image` | `cluster.etcd.extraArgs`, which Talos passes through as `--key=value` for every key it does not set itself | designed from the Talos code, not tested |
+| etcd-operator | `--etcd-image-repository` on the operator, or a per-cluster repository | `spec.extraArgs` | needs two operator changes, see [etcd-operator.md](etcd-operator.md) |
+
+On Talos the data directory is `/var/lib/etcd` and the certificates come from `/system/secrets/etcd`, both mounted into the container, so twok has everything it needs; what is not verified is how Talos's own etcd health checks and `talosctl etcd` commands behave while twok restarts the process underneath them.
 
 ## Security
 
@@ -296,6 +317,8 @@ Every transition is logged with its reason and the generation.
 | A lease with a TTL instead of generations | a lease expires while the holder still serves, and the loser could take it over with stale data; the generation is monotonic and the loser's data says which generation it belongs to |
 | Re-adding the loser by copying a snapshot | the learner path is what etcd supports and what the operator will do; a snapshot copy would need twok to run etcdutl on both sides |
 | twok as a sidecar that only observes, as threek | a takeover needs a restart of etcd with different flags, which only the process's parent can do |
+| etcd embedded in twok as a library | every etcd flag would have to be parsed as etcd parses it, and etcd rebuilt for every release; the supervisor passes the flags through and runs the upstream binary |
+| A binary-only image with the etcd binary copied in by an init container | needs a Pod spec nobody but a hand-written StatefulSet can provide; the impersonating image works wherever an etcd image can be set |
 | Keeping `--force-new-cluster` in the arguments after the takeover | an etcd restart while a learner is joining would remove the learner again |
 
 ## Open questions
