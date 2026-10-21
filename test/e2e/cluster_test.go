@@ -188,7 +188,9 @@ func start(t *testing.T, mode string) *cluster {
 		}
 	}
 
-	c.network = mustDocker(t, "network", "create", prefix)
+	mustDocker(t, "network", "create", prefix)
+	// The name, not the ID: docker inspect keys a container's networks by name.
+	c.network = prefix
 	t.Cleanup(func() { _, _ = docker("network", "rm", c.network) })
 	c.startArbiter()
 
