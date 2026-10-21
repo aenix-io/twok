@@ -62,15 +62,17 @@ The full table, with what was measured and what is only assumed, is in [docs/des
 
 ## How it runs
 
-twok is one binary that starts etcd as a child process and restarts it when it has to:
+twok is a supervisor that starts etcd as a child process and restarts it when it has to.
+It ships as an image that stands in for etcd, built from the upstream etcd image with twok at `/usr/local/bin/etcd` and the real etcd next to it.
+Whatever launches etcd keeps launching `etcd <flags>`; twok takes the `--twok-*` flags for itself and passes the rest through:
 
 ```bash
-twok run --arbiter s3://bucket/clusters/prod -- etcd --name a --data-dir /var/lib/etcd ...
+etcd --name a --data-dir /var/lib/etcd ... --twok-arbiter s3://bucket/clusters/prod
 ```
 
-- **Kubernetes:** a StatefulSet of two Pods, see [deploy/kubernetes/](deploy/kubernetes/).
-- **etcd-operator:** not without changes to the operator, see [docs/etcd-operator.md](docs/etcd-operator.md).
-- **Talos:** not supported; Talos runs etcd itself.
+- **Kubernetes:** a StatefulSet of two Pods with that image, see [deploy/kubernetes/](deploy/kubernetes/).
+- **Talos:** `cluster.etcd.image` and `cluster.etcd.extraArgs`; designed from the Talos code, not tested yet.
+- **etcd-operator:** after two changes to the operator, see [docs/etcd-operator.md](docs/etcd-operator.md).
 
 ## Development
 
