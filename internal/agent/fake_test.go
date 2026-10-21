@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,10 @@ import (
 const clusterID = 0xc1
 
 var errDown = errors.New("connection refused")
+
+// arbiters numbers the in-memory arbiters, so that every harness, also in
+// repeated runs of one test, gets a register of its own.
+var arbiters atomic.Int64
 
 // fakeMember is one etcd member's client API.
 type fakeMember struct {
@@ -309,7 +314,7 @@ func newHarness(t *testing.T, cfg config.Config) *harness {
 		t: t, local: local, peer: peer,
 		wal:  &fakeWAL{local: local},
 		proc: &fakeProcess{local: local},
-		arb:  &flakyArbiter{Arbiter: memarb.New(t.Name())},
+		arb:  &flakyArbiter{Arbiter: memarb.New(fmt.Sprintf("%s/%d", t.Name(), arbiters.Add(1)))},
 		logs: &syncBuffer{},
 		now:  time.Date(2026, 10, 21, 20, 0, 0, 0, time.UTC),
 	}
