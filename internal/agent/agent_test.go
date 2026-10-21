@@ -3,6 +3,9 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/aenix-io/twok/internal/arbiter"
+	"github.com/aenix-io/twok/internal/arbiter/memarb"
 	"github.com/aenix-io/twok/internal/config"
 	"github.com/aenix-io/twok/internal/engine"
 )
@@ -282,8 +286,8 @@ func TestRejoinAfterTwokRestartedDuringTheCrashLoop(t *testing.T) {
 	// where the survivor is.
 	h.agent = New(Options{
 		Config: fastConfig(config.ModeEnforce), Local: h.local, Arbiter: h.arb, WAL: h.wal, Process: h.proc,
-		DataDir: "/var/lib/etcd", PeerEndpoint: h.peer.endpoint, Logger: h.agent.logger, Now: h.agent.now,
-		Dial: func(string) (Client, error) { return h.peer, nil },
+		DataDir: "/var/lib/etcd", PeerEndpoints: []string{h.peer.endpoint}, Logger: h.agent.logger, Now: h.agent.now, Resolver: identityResolver{},
+		Dial: func(string, string) (Client, error) { return h.peer, nil },
 	})
 	h.agent.waitInterval = time.Millisecond
 	h.ticks(10)
@@ -299,12 +303,121 @@ func TestRejoinAfterTwokRestartedDuringTheCrashLoop(t *testing.T) {
 	h2 := removedHarness(t)
 	h2.agent = New(Options{
 		Config: fastConfig(config.ModeEnforce), Local: h2.local, Arbiter: h2.arb, WAL: h2.wal, Process: h2.proc,
-		DataDir: "/var/lib/etcd", Logger: h2.agent.logger, Now: h2.agent.now,
-		Dial: func(string) (Client, error) { return h2.peer, nil },
+		DataDir: "/var/lib/etcd", Logger: h2.agent.logger, Now: h2.agent.now, Resolver: identityResolver{},
+		Dial: func(string, string) (Client, error) { return h2.peer, nil },
 	})
 	h2.ticks(10)
-	if len(h2.peer.added)+len(h2.wal.reids) != 0 || !strings.Contains(h2.logs.String(), "set --peer-endpoint") {
+	if len(h2.peer.added)+len(h2.wal.reids) != 0 || !strings.Contains(h2.logs.String(), "set --peer-endpoints") {
 		t.Errorf("added %v, reidentify %x:\n%s", h2.peer.added, h2.wal.reids, h2.logs)
+	}
+}
+
+// fakeResolver resolves names from a table and counts the lookups.
+type fakeResolver struct {
+	hosts   map[string][]string
+	lookups []string
+}
+
+func (r *fakeResolver) LookupHost(_ context.Context, host string) ([]string, error) {
+	r.lookups = append(r.lookups, host)
+	addrs, ok := r.hosts[host]
+	if !ok {
+		return nil, fmt.Errorf("lookup %s: no such host", host)
+	}
+	return addrs, nil
+}
+
+// TestSurvivorThroughAName finds the survivor through a headless Service's
+// name that resolves to both members: the address that answers as the
+// local member is skipped, and every address is verified as the name.
+func TestSurvivorThroughAName(t *testing.T) {
+	h := removedHarness(t)
+	// The local member answers on its address with its own ID; its client
+	// API is up here, which a shared name cannot tell apart from the
+	// survivor's until it asks.
+	self := &fakeMember{endpoint: "https://10.0.0.1:2379", st: engine.Status{ClusterID: clusterID, MemberID: 0xa}}
+	byEndpoint := map[string]*fakeMember{"https://10.0.0.1:2379": self, "https://10.0.0.2:2379": h.peer}
+	res := &fakeResolver{hosts: map[string][]string{"etcd.ns.svc": {"10.0.0.1", "10.0.0.2"}}}
+	var dialed [][2]string
+	h.agent = New(Options{
+		Config: fastConfig(config.ModeEnforce), Local: h.local, Arbiter: h.arb, WAL: h.wal, Process: h.proc,
+		DataDir: "/var/lib/etcd", PeerEndpoints: []string{"https://etcd.ns.svc:2379"}, Resolver: res,
+		Logger: h.agent.logger, Now: h.agent.now,
+		Dial: func(endpoint, serverName string) (Client, error) {
+			dialed = append(dialed, [2]string{endpoint, serverName})
+			if c, ok := byEndpoint[endpoint]; ok {
+				return c, nil
+			}
+			return &fakeMember{endpoint: endpoint, down: true}, nil
+		},
+	})
+	h.agent.waitInterval = time.Millisecond
+	h.ticks(10)
+	if len(h.peer.added) != 1 || len(h.wal.reids) != 1 {
+		t.Fatalf("added %v, reidentify %x; want a rejoin through the name:\n%s", h.peer.added, h.wal.reids, h.logs)
+	}
+	want := [][2]string{{"https://10.0.0.1:2379", "etcd.ns.svc"}, {"https://10.0.0.2:2379", "etcd.ns.svc"}}
+	if len(dialed) < 2 || dialed[0] != want[0] || dialed[1] != want[1] {
+		t.Errorf("dialed %v, want %v", dialed, want)
+	}
+	if len(self.added) != 0 {
+		t.Errorf("asked the local member to add a learner")
+	}
+}
+
+// The last member list comes first: a name is resolved only when the
+// survivor is not found at the URLs the member list showed.
+func TestMemberListBeforeTheName(t *testing.T) {
+	h := removedHarness(t)
+	res := &fakeResolver{hosts: map[string][]string{"b": {"b"}, "etcd.ns.svc": {"10.0.0.2"}}}
+	h.agent.resolver = res
+	h.agent.peerEndpoints = []string{"https://etcd.ns.svc:2379"}
+	h.agent.engine.SetParams(h.agent.engineParams())
+	h.ticks(10)
+	if len(h.wal.reids) != 1 || slices.Contains(res.lookups, "etcd.ns.svc") || h.dialed[0] != "https://b:2379" {
+		t.Fatalf("reidentify %x, lookups %v, dialed %v; want b from the member list and the name never resolved", h.wal.reids, res.lookups, h.dialed)
+	}
+
+	// With b's URL gone, the name is the fallback.
+	h2 := removedHarness(t)
+	h2.peer.endpoint = "https://10.0.0.2:2379"
+	res2 := &fakeResolver{hosts: map[string][]string{"etcd.ns.svc": {"10.0.0.2"}}}
+	h2.agent.resolver = res2
+	h2.agent.peerEndpoints = []string{"https://etcd.ns.svc:2379"}
+	h2.agent.engine.SetParams(h2.agent.engineParams())
+	h2.ticks(10)
+	if len(h2.wal.reids) != 1 || len(res2.lookups) == 0 || h2.serverNames[len(h2.serverNames)-1] != "etcd.ns.svc" {
+		t.Fatalf("reidentify %x, lookups %v, dialed %v %v", h2.wal.reids, res2.lookups, h2.dialed, h2.serverNames)
+	}
+}
+
+func TestExpand(t *testing.T) {
+	a := New(Options{
+		Logger:   slog.New(slog.DiscardHandler),
+		Resolver: &fakeResolver{hosts: map[string][]string{"etcd": {"10.0.0.1", "fd00::2"}}},
+		Arbiter:  memarb.New(t.Name()),
+	})
+	for _, tt := range []struct {
+		in   string
+		want []candidate
+		err  string
+	}{
+		{"https://10.0.0.9:2379", []candidate{{endpoint: "https://10.0.0.9:2379"}}, ""},
+		{"https://etcd:2379", []candidate{{"https://10.0.0.1:2379", "etcd"}, {"https://[fd00::2]:2379", "etcd"}}, ""},
+		{"http://etcd", []candidate{{"http://10.0.0.1", "etcd"}, {"http://[fd00::2]", "etcd"}}, ""},
+		{"https://missing:2379", nil, "no such host"},
+		{"etcd:2379", nil, "not a URL"},
+	} {
+		got, err := a.expand(context.Background(), tt.in)
+		if tt.err != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.err) {
+				t.Errorf("expand(%q) error = %v, want %q", tt.in, err, tt.err)
+			}
+			continue
+		}
+		if err != nil || !slices.Equal(got, tt.want) {
+			t.Errorf("expand(%q) = %v, %v; want %v", tt.in, got, err, tt.want)
+		}
 	}
 }
 

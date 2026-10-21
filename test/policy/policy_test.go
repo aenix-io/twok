@@ -73,6 +73,7 @@ func memberPod(labels map[string]string, tls, restore bool) map[string]any {
 		command = append(command, "--listen-client-urls=http://0.0.0.0:2379", "--listen-peer-urls=http://0.0.0.0:2380")
 	}
 	spec := map[string]any{
+		"subdomain":                    "etcd-headless",
 		"automountServiceAccountToken": false,
 		"securityContext":              map[string]any{"runAsUser": 65532, "runAsGroup": 65532, "fsGroup": 65532},
 		"containers": []any{map[string]any{
@@ -199,6 +200,7 @@ func TestInjectsIntoTLSMember(t *testing.T) {
 		"--data-dir=/var/lib/etcd",
 		"--config-dir=/etc/twok",
 		"--metrics-listen=:2390",
+		"--peer-endpoints=https://etcd-headless.default.svc:2379",
 		"--cert-file=/etc/etcd/tls/client/tls.crt",
 		"--key-file=/etc/etcd/tls/client/tls.key",
 		"--trusted-ca-file=/etc/etcd/tls/client/ca.crt",
@@ -243,6 +245,7 @@ func TestInjectsIntoPlaintextMember(t *testing.T) {
 		"--data-dir=/var/lib/etcd",
 		"--config-dir=/etc/twok",
 		"--metrics-listen=:2390",
+		"--peer-endpoints=http://etcd-headless.default.svc:2379",
 	}
 	if !slices.Equal(agent.Args, want) {
 		t.Errorf("args = %v, want %v", agent.Args, want)
@@ -273,6 +276,26 @@ func TestArbiterFromAnnotation(t *testing.T) {
 	for _, arg := range agent.Args {
 		if strings.HasPrefix(arg, "--arbiter=") {
 			t.Errorf("args = %v, want no --arbiter without the annotation", agent.Args)
+		}
+	}
+}
+
+// The peer endpoints come from the Pod's subdomain, the headless Service
+// that resolves to every member. Without a subdomain there is no flag.
+func TestPeerEndpointsFromSubdomain(t *testing.T) {
+	manifest := memberPod(nil, false, false)
+	manifest["spec"].(map[string]any)["subdomain"] = "etcd-members"
+	agent := mustAgent(t, admit(t, manifest))
+	if !slices.Contains(agent.Args, "--peer-endpoints=http://etcd-members.default.svc:2379") {
+		t.Errorf("args = %v, want --peer-endpoints from the subdomain", agent.Args)
+	}
+
+	manifest = memberPod(nil, false, false)
+	delete(manifest["spec"].(map[string]any), "subdomain")
+	agent = mustAgent(t, admit(t, manifest))
+	for _, arg := range agent.Args {
+		if strings.HasPrefix(arg, "--peer-endpoints=") {
+			t.Errorf("args = %v, want no --peer-endpoints without a subdomain", agent.Args)
 		}
 	}
 }

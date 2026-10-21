@@ -47,8 +47,16 @@ type Client interface {
 	Close() error
 }
 
-// Dialer returns a client for another member's endpoint.
-type Dialer func(endpoint string) (Client, error)
+// Dialer returns a client for another member's endpoint. serverName is the
+// name to verify the member's certificate against when the endpoint is an
+// address a DNS name resolved to; empty means the endpoint's host.
+type Dialer func(endpoint, serverName string) (Client, error)
+
+// Resolver resolves a host name to addresses; net.DefaultResolver outside
+// tests.
+type Resolver interface {
+	LookupHost(ctx context.Context, host string) ([]string, error)
+}
 
 // WAL edits a stopped member's write-ahead log with etcd's own WAL package.
 // Each operation takes the WAL's file lock first and returns ErrWALLocked

@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -96,11 +98,13 @@ func newWorldPerSite(t *testing.T, cfg0, cfg1 config.Config) *world {
 	return w
 }
 
-func (w *world) startAgent(s *site, cfg config.Config) {
+func (w *world) startAgent(s *site, cfg config.Config, tweaks ...func(*agent.Options)) {
 	t := w.t
 	tlsFiles := s.m.TLS
-	dial := func(endpoint string) (agent.Client, error) {
-		c, err := agent.NewEtcdClient(agent.EtcdConfig{Endpoint: endpoint, CertFile: tlsFiles.CertFile, KeyFile: tlsFiles.KeyFile, CAFile: tlsFiles.CAFile})
+	dial := func(endpoint, serverName string) (agent.Client, error) {
+		c, err := agent.NewEtcdClient(agent.EtcdConfig{
+			Endpoint: endpoint, CertFile: tlsFiles.CertFile, KeyFile: tlsFiles.KeyFile, CAFile: tlsFiles.CAFile, ServerName: serverName,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -110,7 +114,7 @@ func (w *world) startAgent(s *site, cfg config.Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := agent.New(agent.Options{
+	opts := agent.Options{
 		Config:  cfg,
 		Local:   local,
 		Dial:    dial,
@@ -119,7 +123,11 @@ func (w *world) startAgent(s *site, cfg config.Config) {
 		Process: &supervised{s: s},
 		DataDir: s.m.DataDir,
 		Logger:  slog.New(slog.NewJSONHandler(s.logs, nil)).With("member", s.m.Name),
-	})
+	}
+	for _, tweak := range tweaks {
+		tweak(&opts)
+	}
+	a := agent.New(opts)
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel, s.done = cancel, make(chan struct{})
 	go func() {
@@ -736,6 +744,103 @@ func TestIntegrationRemovedBeforeTheArbiterWasRead(t *testing.T) {
 		t.Error("m0 claimed")
 	}
 	w.checkAcked(wr.halt())
+}
+
+// TestIntegrationSurvivorThroughAName finds the survivor only through a
+// name that resolves to both members, as a headless Service's does: the
+// loser's agent is restarted while it is cut off, never reads a member
+// list, and has only https://localhost:<port>, which resolves to
+// 127.0.0.2 and 127.0.0.3, each forwarding to one member's client port.
+// etcdtest's certificates carry localhost, not those addresses, so the
+// rejoin also shows that the name, not the address, is verified.
+func TestIntegrationSurvivorThroughAName(t *testing.T) {
+	slow := fast(config.ModeEnforce)
+	slow.ClaimAfter = time.Hour
+	w := newWorldPerSite(t, slow, fast(config.ModeEnforce))
+	loser, survivor := w.sites[0], w.sites[1]
+	port := forwardPair(t, loser.m.ClientURL, survivor.m.ClientURL)
+	w.waitPaired(0, 30*time.Second)
+	w.cut()
+	waitFor(t, time.Minute, "m1 serving alone", func() bool {
+		rec, ok := w.record()
+		return ok && rec.Survivor == survivor.m.Name && survivor.generation() == 1
+	})
+	loser.stopAgent()
+	res := &tableResolver{hosts: map[string][]string{"localhost": {"127.0.0.2", "127.0.0.3"}}}
+	w.startAgent(loser, slow, func(o *agent.Options) {
+		o.Local = &noMembers{Client: o.Local}
+		o.PeerEndpoints = []string{"https://localhost:" + port}
+		o.Resolver = res
+	})
+	w.heal()
+	w.waitPaired(1, 4*time.Minute)
+	waitFor(t, 2*time.Minute, "m0's agent seeing etcd back", func() bool {
+		return strings.Contains(loser.logs.String(), `"msg":"rejoin: etcd runs as the new learner"`)
+	})
+	if want := `"survivor":"https://127.0.0.3:` + port + `"`; !strings.Contains(loser.logs.String(), want) {
+		t.Errorf("m0 did not find the survivor through the name, want %s:\n%s", want, tail(loser.logs.String(), 30))
+	}
+}
+
+// noMembers hides the member list, as for an agent that never saw it.
+type noMembers struct{ agent.Client }
+
+func (noMembers) Members(context.Context) (engine.Members, error) {
+	return engine.Members{}, errors.New("test: no member list")
+}
+
+type tableResolver struct{ hosts map[string][]string }
+
+func (r *tableResolver) LookupHost(_ context.Context, host string) ([]string, error) {
+	if addrs, ok := r.hosts[host]; ok {
+		return addrs, nil
+	}
+	return nil, fmt.Errorf("lookup %s: no such host", host)
+}
+
+// forwardPair listens on 127.0.0.2 and 127.0.0.3 on one port, forwarding
+// to the two client URLs, and returns the port.
+func forwardPair(t *testing.T, to0, to1 string) string {
+	t.Helper()
+	for range 20 {
+		l0, err := net.Listen("tcp", "127.0.0.2:0")
+		if err != nil {
+			t.Skipf("no 127.0.0.2 on this host: %v", err)
+		}
+		_, port, _ := net.SplitHostPort(l0.Addr().String())
+		l1, err := net.Listen("tcp", "127.0.0.3:"+port)
+		if err != nil {
+			_ = l0.Close()
+			continue
+		}
+		forward(t, l0, strings.TrimPrefix(to0, "https://"))
+		forward(t, l1, strings.TrimPrefix(to1, "https://"))
+		return port
+	}
+	t.Fatal("no port free on both 127.0.0.2 and 127.0.0.3")
+	return ""
+}
+
+func forward(t *testing.T, l net.Listener, target string) {
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			in, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = in.Close() }()
+				out, err := net.Dial("tcp", target)
+				if err != nil {
+					return
+				}
+				defer func() { _ = out.Close() }()
+				go func() { _, _ = io.Copy(out, in) }()
+				_, _ = io.Copy(in, out)
+			}()
+		}
+	}()
 }
 
 // lockedBuffer collects an agent's log.

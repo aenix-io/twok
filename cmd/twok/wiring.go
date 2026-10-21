@@ -8,8 +8,12 @@ import (
 )
 
 // dialMember connects to one member's client API.
-func dialMember(endpoint string, tls tlsFiles) (agent.Client, error) {
-	return agent.NewEtcdClient(agent.EtcdConfig{Endpoint: endpoint, CertFile: tls.certFile, KeyFile: tls.keyFile, CAFile: tls.caFile})
+// serverName, when set, is what the member's certificate is verified
+// against instead of the endpoint's host.
+func dialMember(endpoint, serverName string, tls tlsFiles) (agent.Client, error) {
+	return agent.NewEtcdClient(agent.EtcdConfig{
+		Endpoint: endpoint, CertFile: tls.certFile, KeyFile: tls.keyFile, CAFile: tls.caFile, ServerName: serverName,
+	})
 }
 
 // newWAL returns the WAL operations, logging through etcd's logger as the

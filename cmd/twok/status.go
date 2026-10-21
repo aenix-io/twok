@@ -73,7 +73,7 @@ func status(ctx context.Context, m memberFlags, arbiterURL string) statusOutput 
 	fail := func(format string, args ...any) { out.Errors = append(out.Errors, fmt.Sprintf(format, args...)) }
 	obs := engine.Observation{Now: time.Now(), ArbiterReady: true, CanControl: true}
 
-	if c, err := dialMember(m.endpoint, m.tls); err != nil {
+	if c, err := dialMember(m.endpoint, "", m.tls); err != nil {
 		fail("%v", err)
 	} else {
 		defer func() { _ = c.Close() }()

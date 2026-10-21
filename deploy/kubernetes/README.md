@@ -38,6 +38,7 @@ The ConfigMap ships with `mode: "off"`, so a fresh deployment only observes; set
 | `--endpoint` | flag | `http://127.0.0.1:2379` | the local member |
 | `--data-dir` | flag | `/var/lib/etcd` | etcd's data directory, on the shared volume |
 | `--metrics-listen` | flag | `:2390` | Prometheus metrics |
+| `--peer-endpoints` | flag | `http://etcd.<namespace>.svc:2379` | the headless Service, which resolves to both members; a member that lost a takeover finds the survivor through it when it has no member list to go by |
 | `mode` | ConfigMap | `off` | `off` observes and logs, `dry-run` decides and logs, `enforce` acts; a missing ConfigMap means `off` |
 | `poll-interval` | ConfigMap | `1s` | how often the local member's status is read |
 | `claim-after` | ConfigMap | `20s` | how long the cluster must be without a leader before a claim |
