@@ -63,6 +63,80 @@ The same tests show that nobody serves writes while the arbiter is unreachable, 
 A cut of one proxy direction does not produce a one-way partition for Raft: each member dials the other, and etcd falls back from its streams to its pipeline connections, so messages still flow both ways through the connections the other member dialed, and no leader is lost.
 A one-way partition needs packets dropped by direction, which the Kubernetes bench does with a Cilium egress policy; the proxy test only checks that nothing unsafe happens.
 
+## End-to-end tests in containers
+
+`test/e2e/`, behind the build tag `e2e`, runs the whole thing in docker: two etcd members, a twok agent next to each, and `twok arbiter serve` as the http arbiter in a third container, all on one docker network.
+CI runs it for every etcd version in `build/etcd.sha256`, in the `e2e` job; the whole suite takes about two minutes, the five tests run in parallel.
+
+```bash
+make image IMAGE=twok:dev VERSION=dev
+E2E_IMAGE=twok:dev ETCD_IMAGE=gcr.io/etcd-development/etcd:v3.6.15 go test -tags e2e -timeout 20m -v ./test/e2e/
+```
+
+### Layout
+
+- Each member is laid out as a Pod with `shareProcessNamespace: true`: a pod container (Alpine with iptables, `--init`) holds the network and PID namespaces and the published ports, and the etcd and twok containers join both.
+  The namespaces cannot belong to the etcd container itself: when etcd, the init process of its PID namespace, exits, the kernel kills every other process in the namespace, twok included, in the middle of the takeover it stopped etcd for.
+- etcd runs with `--restart=always`, so docker starts it again after twok stopped it, as the kubelet does; the agent runs with `--restart=always` as well.
+- etcd and twok run as 65532 without capabilities and with a read-only root, and share the member's data volume at `/var/lib/etcd`; twok finds etcd through `/proc` and stops it with `SIGTERM` as the same user.
+- Client and peer mTLS with certificates from `internal/etcdtest`, default heartbeat and election timeout, default twok timers, mode `enforce` unless the test says otherwise.
+- Writers: the test writes `w/<member>/<seq>` to each member separately through its published client port, a put every 0.2 s with a 1 s timeout, and records every outcome.
+- Observation: the test reads each member's status and the arbiter record twice a second, the agents' metrics, and the agents' JSON logs; the containers share the host's clock, so the timeline needs no offsets.
+- Cuts: iptables DROP rules in the members' pod containers, without resets.
+  Both directions drop everything between the two member addresses; one direction drops the packets from the leader to the follower, in the leader's `OUTPUT` and the follower's `INPUT`; the arbiter cut drops everything between both members and the arbiter.
+
+### Scenarios
+
+| Test | What happens | Asserted |
+| --- | --- | --- |
+| `TestPartitionTwoWay` | partition in both directions, healed once the loser is stale | within 60 s exactly one member accepts writes, the last leader; the loser accepts none until it has rejoined; after the heal the loser is a voter again and every acknowledged key is on both |
+| `TestPartitionOneWay` | the packets from the leader to the follower are dropped | the same, except which member survives, which is recorded |
+| `TestArbiterUnreachable` | the arbiter is cut from both members, then the partition; the arbiter is restored after 60 s | nobody accepts writes for 60 s, both agents isolated with the arbiter unreachable and no record; after the restore one member takes over and holds every acknowledged key |
+| `TestSurvivorLostBeforeRejoin` | partition, takeover, then the survivor's pod, etcd and twok containers are killed and the partition rules removed; the survivor is started again 45 s later | the loser stays stale and accepts no writes while the survivor is down, the record does not change; after the survivor is back the pair forms again with every acknowledged key |
+| `TestDryRun` | partition in mode `dry-run` | nobody accepts writes for 60 s, the agents count the claim they would make, the arbiter has no record |
+
+### Results
+
+CI run of 2026-10-21 on GitHub-hosted runners, seconds from the cut; all ten runs passed.
+
+| Test | etcd | Survivor | Survivor accepts writes | Loser accepts writes again | Acknowledged keys on both |
+| --- | --- | --- | --- | --- | --- |
+| two-way | v3.5.34 | a, the last leader | +30.2 s | +44.7 s, heal at +41.6 s | 98 of 98 |
+| two-way | v3.6.15 | a, the last leader | +29.5 s | +44.5 s, heal at +42.2 s | 97 of 97 |
+| one-way, leader b to a | v3.5.34 | b, the leader whose packets were dropped | +30.5 s | +47.0 s, heal at +42.6 s | 106 of 106 |
+| one-way, leader a to b | v3.6.15 | a, the leader whose packets were dropped | +30.9 s | +44.5 s, heal at +42.2 s | 95 of 95 |
+| arbiter unreachable | v3.5.34 | a | +65.7 s, arbiter back at +60.1 s | | 15 of 15 on a |
+| arbiter unreachable | v3.6.15 | a | +63.0 s, arbiter back at +60.2 s | | 15 of 15 on a |
+| survivor lost | v3.5.34 | a | +29.4 s; killed at +31.3 s, back at +76.7 s, writes at +78.7 s | +90.8 s | 95 of 95 |
+| survivor lost | v3.6.15 | a | +29.6 s; killed at +31.3 s, back at +76.9 s, writes at +77.8 s | +84.9 s | 71 of 71 |
+| dry-run | v3.5.34 | none | none for 60 s | none for 60 s | |
+| dry-run | v3.6.15 | none | none for 60 s | none for 60 s | |
+
+- No member accepted a write while the other one could, in any run, and no acknowledged write was lost.
+- The last leader won every two-way partition, as `follower-extra-delay` intends. In the one-way partitions the leader whose packets to the follower were dropped won both times: both members lose the leader within two seconds, so the cut direction does not matter to the claim. Unlike a cut of one proxy direction above, dropping packets by direction does take the leader away from both members.
+- The takeover takes about 30 s from the cut, as [design.md](design.md#expected-timeline-with-defaults) expects: about 20 s of `claim-after` after the leader is gone, the 3 s of `claim-delay`, then 3 to 5 s from the won claim to the first acknowledged write, for the next poll, the WAL edit and etcd's restart.
+- The pair is restored 3 to 6 s after the heal. That is much faster than the 48 s the Kubernetes baseline needed only to re-elect a leader, because the rejoin restarts the loser's etcd, and with it the peer connections that sat through the partition.
+- With the arbiter unreachable, both agents stay isolated and nothing is claimed; the claim follows within 2 s of the arbiter's return.
+- While the survivor was down, the loser's agent retried the rejoin and failed on the survivor's client URL, and the loser stayed stale; 5 to 12 s after the survivor came back the loser was a learner, and 2 to 3 s later a voter.
+
+The two-way partition on v3.6.15, as the test logged it, without the startup lines:
+
+| T | Event |
+| --- | --- |
+| +0.0 s | partition applied; both writers' last acknowledged put returned at -0.2 s |
+| +1.8 s | neither member has a leader |
+| +21.8 s | b's agent: pair to isolated, claims after the delay of a follower |
+| +22.5 s | a's agent: pair to isolated, claims after the delay of the last leader |
+| +26.5 s | a's agent wins the claim; the record holds generation 1, survivor a |
+| +27.5 s | a's agent stops etcd, edits the WAL on the first attempt, docker starts etcd again |
+| +29.5 s | a leads a cluster of one and accepts writes |
+| +30.8 s | b's agent loses its claim, +31.8 s goes stale |
+| +42.2 s | partition removed |
+| +43.0 s | b's agent adds b as a learner of a, stops etcd, rewrites the WAL under the new ID |
+| +43.4 s | b runs as a learner of a |
+| +44.5 s | a's agent promotes b; b accepts writes |
+| +45.5 s | both agents report pair; docker restarted each etcd once |
+
 ## Kubernetes test bench
 
 A two-member etcd on a real Kubernetes cluster, partitioned with Cilium network policies.
