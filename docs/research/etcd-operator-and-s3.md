@@ -1,6 +1,6 @@
 # Research: cozystack/etcd-operator v0.5.4 and S3 conditional writes
 
-All file:line references in Topic A are against `https://github.com/cozystack/etcd-operator` tag `v0.5.4` (commit `a60dd56`), cloned at `<workdir>/etcd-operator`.
+All file:line references in Topic A are against `https://github.com/cozystack/etcd-operator` tag `v0.5.4` (commit `a60dd56`), cloned at `workdir/etcd-operator`.
 
 ## Topic A: etcd-operator v0.5.4 (etcd-operator.cozystack.io/v1alpha2)
 
@@ -89,7 +89,6 @@ Would the operator fight a twok-style reconfiguration? The scenario is: the surv
 ---
 
 ## Topic B: Conditional writes (CAS) on S3-compatible stores
-
 
 Research date: 2026-10-21. Web research only. Where a fact comes from a community report rather than vendor docs, it is marked **(community)**. "Not found" means I looked and found no authoritative statement.
 

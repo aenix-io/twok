@@ -2,7 +2,7 @@
 
 Scope: input for designing `twok` (two-node etcd with an external arbiter instead of BMC fencing).
 
-## Sources (all read locally, shallow clones under `<workdir>/`)
+## Sources (all read locally, shallow clones under `workdir/`)
 
 | Alias | Source | Revision |
 | --- | --- | --- |

@@ -1,6 +1,6 @@
 # etcd internals relevant to twok (force-new-cluster / learner rejoin)
 
-Sources (shallow clones under <workdir>/):
+Sources (shallow clones under workdir/):
 
 - `etcd-3.5.12/`: tag v3.5.12 (the operator's version). Paths below without a prefix refer to this tree for 3.5.
 - `etcd-3.5/`: branch release-3.5 head (v3.5.34, 2026-09-22).

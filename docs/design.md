@@ -19,7 +19,7 @@ twok is a supervisor that runs the etcd process on each of the two members. It w
 
 The arbiter is involved only when the cluster has lost its leader. It is not on the write path, it stores a few hundred bytes, and it needs no low latency. It can be an S3 bucket, another etcd cluster, a Kubernetes API server, or any HTTP service that implements the contract in [Arbiter backends](#arbiter-backends).
 
-This is the mechanism Red Hat ships in two-node OpenShift with fencing, with one difference. Red Hat fences the other node through its BMC before the survivor reconfigures etcd, and that fencing both breaks the tie and stops the other node. twok breaks the tie with the arbiter and relies on Raft to stop the other node's etcd, which it does by construction: a voter without a quorum commits nothing. twok fences etcd, not the node. Workloads and storage on the losing node are out of scope; see [What is not covered](#what-is-not-covered).
+This is the mechanism Red Hat ships in two-node OpenShift with fencing, with one difference. Red Hat fences the other node through its BMC before the survivor reconfigures etcd, and that fencing both breaks the tie and stops the other node. twok breaks the tie with the arbiter and relies on Raft to stop the other node's etcd, which it does by construction: a voter without a quorum commits nothing. twok fences etcd, not the node. Workloads and storage on the losing node are out of scope; see [Failure model](#failure-model).
 
 ## The model
 
