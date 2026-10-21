@@ -33,6 +33,9 @@ type node struct {
 	reachesArbiter bool
 	canControl     bool
 	result         *Result
+	// removed is set while etcd exits in a loop because the survivor told
+	// it that it was removed.
+	removed bool
 	// loseClaimResult makes the next claim write the record and report an
 	// error, as a response lost on the way back does.
 	loseClaimResult bool
@@ -102,7 +105,7 @@ func (w *world) peer(n *node) *node {
 func (w *world) leader(n *node) uint64 {
 	p := w.peer(n)
 	switch {
-	case !n.up:
+	case !n.up || n.removed:
 		return 0
 	case n.isLearner:
 		if w.linkUp && p.up {
@@ -153,9 +156,16 @@ func peerURL(name string) string   { return "https://" + name + ":2380" }
 func clientURL(name string) string { return "https://" + name + ":2379" }
 
 func (w *world) observation(n *node) Observation {
-	o := Observation{Now: w.now, CanControl: n.canControl, ArbiterReady: true, Result: n.result}
+	// Name and peer URLs come from etcd's command line, which twok reads
+	// whenever the process runs.
+	o := Observation{
+		Now: w.now, CanControl: n.canControl, ArbiterReady: true, Result: n.result,
+		Name: n.name, PeerURLs: []string{peerURL(n.name)},
+	}
 	n.result = nil
-	if !n.up {
+	if !n.up || n.removed {
+		// The WAL still says who the member is.
+		o.WAL = &WALState{MemberID: n.id, ClusterID: clusterID}
 		return o
 	}
 	o.Local = &Status{ClusterID: clusterID, MemberID: n.id, Leader: w.leader(n), IsLearner: n.isLearner, CommitIndex: 100, AppliedIndex: 100}
@@ -240,7 +250,7 @@ func (w *world) execute(n *node, a Action) *Result {
 		w.nextID++
 		id := w.nextID
 		p.learners = append(p.learners, id)
-		n.id, n.isLearner = id, true
+		n.id, n.isLearner, n.removed = id, true, false
 		n.voters, n.learners = slices.Clone(p.voters), slices.Clone(p.learners)
 		n.gen = p.gen
 		r.Learner = id
@@ -269,11 +279,19 @@ func (w *world) byID(id uint64) *node {
 	return nil
 }
 
-// sync lets a connected learner catch up and a pair share the key.
+// sync lets a connected learner catch up and a pair share the key, and
+// makes a voter that reaches a survivor which removed it exit, as etcd
+// does when the survivor answers its peer stream with 410.
 func (w *world) sync() {
 	a, b := w.nodes[0], w.nodes[1]
 	if !w.linkUp || !a.up || !b.up {
 		return
+	}
+	for _, n := range w.nodes {
+		p := w.peer(n)
+		if !n.isLearner && len(n.voters) == 2 && len(p.voters) == 1 && p.voters[0] == p.id {
+			n.removed = true
+		}
 	}
 	if l := w.leader(a); l != 0 && l == w.leader(b) {
 		g := max(a.gen, b.gen)
@@ -327,7 +345,7 @@ func (n *node) count(kind ActionKind) int {
 }
 
 func (n *node) serving(w *world) bool {
-	return n.up && !n.isLearner && w.leader(n) == n.id && len(n.voters) == 1
+	return n.up && !n.removed && !n.isLearner && w.leader(n) == n.id && len(n.voters) == 1
 }
 
 func (w *world) String() string {

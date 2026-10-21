@@ -39,6 +39,11 @@ type Params struct {
 	// at start, rejoin attempts, and failed takeovers and generation
 	// writes.
 	RetryDelay time.Duration
+	// DownAfter is how long etcd must not answer before the engine
+	// looks for a newer generation in the arbiter. A member whose etcd
+	// learned that it was removed exits and is restarted in a loop, and
+	// may never have read the arbiter while it ran.
+	DownAfter time.Duration
 	// JoinTimeout is how long a member that rejoined under a new ID waits
 	// to see itself as a learner before it tries again.
 	JoinTimeout time.Duration
@@ -61,6 +66,7 @@ func DefaultParams() Params {
 		ClaimDelay:         3 * time.Second,
 		FollowerExtraDelay: 5 * time.Second,
 		RetryDelay:         5 * time.Second,
+		DownAfter:          3 * time.Second,
 		JoinTimeout:        2 * time.Minute,
 		PromoteBackoff:     time.Second,
 		MaxPromoteBackoff:  30 * time.Second,
@@ -84,6 +90,8 @@ type Engine struct {
 	generationKnown bool
 	lastLeader      uint64
 	noLeaderSince   time.Time
+	// downSince is when etcd stopped answering, zero while it answers.
+	downSince time.Time
 
 	// arb is the last successful read of the arbiter, at arbAt.
 	arb         *ArbiterRead
@@ -159,8 +167,20 @@ func (e *Engine) learn(o Observation) {
 	}
 	l := o.Local
 	if l == nil {
+		if e.downSince.IsZero() {
+			e.downSince = o.Now
+		}
+		// The WAL is where etcd takes its identity from at every start, so
+		// while etcd is down it says who the member is.
+		if w := o.WAL; w != nil && w.MemberID != 0 {
+			e.self = w.MemberID
+			if w.ClusterID != 0 {
+				e.clusterID = w.ClusterID
+			}
+		}
 		return
 	}
+	e.downSince = time.Time{}
 	e.self, e.clusterID = l.MemberID, l.ClusterID
 	if l.Leader != 0 {
 		e.lastLeader = l.Leader
@@ -260,6 +280,24 @@ func (e *Engine) survivorIsSelf(rec arbiter.Record) bool {
 	return rec.Survivor != "" && rec.Survivor == e.name
 }
 
+// down reports whether etcd has not answered for DownAfter.
+func (e *Engine) down(o Observation) bool {
+	return o.Local == nil && !e.downSince.IsZero() && o.Now.Sub(e.downSince) >= e.p.DownAfter
+}
+
+// staleOffline reports whether a member whose etcd does not answer, and
+// whose generation twok never read, is a candidate for a rejoin: the
+// arbiter names another member of the same cluster as survivor. Without
+// etcd the generation key cannot be read, so this is not yet the proof.
+// The proof is the survivor's membership, which the agent checks before
+// anything changes: the survivor leads alone and does not list this
+// member's current ID, so a takeover removed this member after it was a
+// voter. A member that is not stale fails that check and nothing happens.
+func (e *Engine) staleOffline(o Observation) bool {
+	return e.down(o) && !e.generationKnown && e.self != 0 && e.arb != nil && e.arb.Found &&
+		!e.survivorIsSelf(e.arb.Record) && e.arb.Record.Generation > 0
+}
+
 // stale reports whether the arbiter knows a newer generation than the
 // local data, claimed by another member.
 func (e *Engine) stale() bool {
@@ -274,9 +312,9 @@ func (e *Engine) role(o Observation) Role {
 		return RoleSolo
 	case l != nil && l.IsLearner:
 		return RoleJoining
-	case l != nil && e.joinedAs != 0 && l.MemberID == e.joinedAs && o.Now.Sub(e.joinedAt) < e.p.JoinTimeout:
+	case e.joinedAs != 0 && e.self == e.joinedAs && o.Now.Sub(e.joinedAt) < e.p.JoinTimeout:
 		return RoleJoining
-	case e.stale():
+	case e.stale(), e.staleOffline(o):
 		return RoleStale
 	case l == nil:
 		return RoleUnknown
@@ -307,7 +345,7 @@ func (e *Engine) decide(o Observation) Decision {
 	}
 	switch role {
 	case RoleUnknown:
-		return Decision{Role: role, Note: "etcd does not answer"}
+		return e.unknown(o)
 	case RoleJoining:
 		return e.joining(o)
 	case RoleStale:
@@ -360,6 +398,28 @@ func (e *Engine) startup(o Observation, role Role) (Decision, bool) {
 		return Decision{}, false
 	}
 	return Decision{Role: role, Action: Action{Kind: ActionReadArbiter}, Note: "reading the arbiter at start"}, true
+}
+
+// unknown is a member whose etcd does not answer. etcd that learns from
+// the survivor that it was removed exits, also before this member's own
+// isolation led it to the arbiter; a member whose etcd stays down is
+// therefore checked against the arbiter, every RetryDelay.
+func (e *Engine) unknown(o Observation) Decision {
+	d := Decision{Role: RoleUnknown, Note: "etcd does not answer"}
+	switch {
+	case !e.down(o) || e.p.Mode == ModeOff:
+		return d
+	case o.Arbiter != nil:
+		if o.Arbiter.Err != nil {
+			d.Note = "etcd does not answer and the arbiter is unreachable"
+		}
+		return d
+	case o.Now.Before(e.readRetryAt) || (e.arb != nil && o.Now.Before(e.arbAt.Add(e.p.RetryDelay))):
+		return d
+	}
+	d.Action = Action{Kind: ActionReadArbiter}
+	d.Note = "etcd does not answer, reading the arbiter"
+	return d
 }
 
 func (e *Engine) pair(o Observation) Decision {
@@ -523,6 +583,9 @@ func (e *Engine) rejoin(o Observation) Decision {
 	rec := e.arb.Record
 	d := Decision{Role: RoleStale}
 	base := fmt.Sprintf("generation %d is behind the arbiter's %d (survivor %s)", e.generation, rec.Generation, rec.Survivor)
+	if !e.generationKnown {
+		base = fmt.Sprintf("etcd does not answer and the arbiter names %s the survivor of generation %d", rec.Survivor, rec.Generation)
+	}
 	if wait := e.until(o.Now, ActionRejoin); wait > 0 {
 		d.Note, d.Wait = base+", the last rejoin attempt failed, retrying", wait
 		return d
@@ -560,6 +623,7 @@ func (e *Engine) rejoin(o Observation) Decision {
 		ClusterID:         e.clusterID,
 		PeerURLs:          slices.Clone(e.peerURLs),
 		Learner:           e.learner,
+		Self:              e.self,
 	}
 	d.Note = base + ", rejoining as a learner"
 	return d

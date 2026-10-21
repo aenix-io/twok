@@ -38,7 +38,7 @@ type walOutput struct {
 // inspectWAL describes the member's WAL for twok status. It takes no lock
 // and works while etcd runs.
 func inspectWAL(dataDir string) (any, error) {
-	st, err := agent.WALOps{Logger: zap.NewNop()}.Inspect(dataDir)
+	st, err := agent.WALOps{Logger: zap.NewNop()}.State(dataDir)
 	if err != nil {
 		return nil, err
 	}

@@ -63,6 +63,9 @@ type WAL interface {
 	// Cleanup removes what Reidentify kept to undo the edit, once the
 	// member is a voter again.
 	Cleanup(dataDir string) error
+	// Inspect reads the WAL without writing and without a lock: the
+	// member's identity and the membership its log holds.
+	Inspect(dataDir string) (engine.WALState, error)
 }
 
 // Process is the etcd process that uses the data directory.

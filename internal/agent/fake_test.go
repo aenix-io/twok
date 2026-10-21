@@ -149,6 +149,8 @@ type fakeWAL struct {
 	standalones []string
 	reids       []uint64
 	cleanups    int
+	inspects    int
+	inspectErr  error
 }
 
 func (w *fakeWAL) Standalone(dataDir string, self uint64, remove []uint64) error {
@@ -182,6 +184,22 @@ func (w *fakeWAL) Reidentify(_ string, newID uint64) error {
 		f.st.MemberID, f.st.IsLearner, f.st.Leader = newID, true, 0
 	})
 	return nil
+}
+
+func (w *fakeWAL) Inspect(string) (engine.WALState, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.inspects++
+	if w.inspectErr != nil {
+		return engine.WALState{}, w.inspectErr
+	}
+	w.local.mu.Lock()
+	defer w.local.mu.Unlock()
+	st := engine.WALState{MemberID: w.local.st.MemberID, ClusterID: w.local.st.ClusterID}
+	for _, m := range append(w.local.members.Voters, w.local.members.Learners...) {
+		st.Members = append(st.Members, m.ID)
+	}
+	return st, nil
 }
 
 func (w *fakeWAL) Cleanup(string) error {

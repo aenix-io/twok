@@ -39,9 +39,15 @@ const (
 	// stopTimeout bounds the wait for etcd to exit after SIGTERM.
 	stopTimeout = time.Minute
 	// restartTimeout bounds the wait for etcd to answer again after an
-	// edit. The kubelet restarts a container with a growing backoff, so a
-	// member stopped several times in a row can take minutes to return.
-	restartTimeout = 5 * time.Minute
+	// edit. The kubelet restarts a container with a backoff that grows to
+	// five minutes, and an etcd that exited in a loop as a removed member
+	// has reached it, so the wait must outlast it. A rejoin that times out
+	// here is resumed at the next attempt: the survivor already lists the
+	// member's new ID as a learner.
+	restartTimeout = 6 * time.Minute
+	// inspectEvery paces the offline reads of the WAL while etcd does not
+	// answer: each reads the whole log.
+	inspectEvery = 5 * time.Second
 	// walAttempts bounds how often etcd is stopped again when it was
 	// started before the edit could take the WAL lock.
 	walAttempts = 5
@@ -110,6 +116,8 @@ type Agent struct {
 	controlled bool
 	args       etcdargs.Args
 	self       uint64
+	inspected  *engine.WALState
+	inspectAt  time.Time
 	result     *engine.Result
 	role       engine.Role
 	peers      map[string]Client
@@ -334,9 +342,11 @@ func (a *Agent) observe(ctx context.Context, now time.Time) engine.Observation {
 		a.metrics.pollFailures.Inc()
 		a.metrics.leaderSeen.Set(0)
 		a.logChange("poll", slog.LevelWarn, "etcd does not answer", err.Error(), "endpoint", a.local.Endpoint(), "error", err)
+		o.WAL = a.inspectWAL(now)
 		return o
 	}
 	delete(a.lastLog, "poll")
+	a.inspected, a.inspectAt = nil, time.Time{}
 	o.Local = &st
 	a.self = st.MemberID
 	a.metrics.lastPoll.Set(float64(now.Unix()))
@@ -361,6 +371,30 @@ func (a *Agent) observe(ctx context.Context, now time.Time) engine.Observation {
 		o.LearnerStatus = a.learnerStatus(ctx, o.Members.Learners)
 	}
 	return o
+}
+
+// inspectWAL reads the WAL offline while etcd does not answer, so that the
+// engine knows who the member is even if etcd never answered since twok
+// started. The read takes no lock; a read that fails, for example while
+// etcd starts and repairs the log's tail, is skipped and the previous one
+// kept.
+func (a *Agent) inspectWAL(now time.Time) *engine.WALState {
+	if a.inspected != nil && now.Before(a.inspectAt.Add(inspectEvery)) {
+		return a.inspected
+	}
+	a.inspectAt = now
+	st, err := a.wal.Inspect(a.dataDir)
+	if err != nil {
+		a.logChange("inspect", slog.LevelWarn, "cannot read the WAL while etcd does not answer", err.Error(), "error", err)
+		return a.inspected
+	}
+	delete(a.lastLog, "inspect")
+	if a.inspected == nil || a.inspected.MemberID != st.MemberID {
+		a.logger.Info("read the WAL while etcd does not answer", "member", engine.Hex(st.MemberID),
+			"cluster", engine.Hex(st.ClusterID), "members", hexes(st.Members))
+	}
+	a.inspected = &st
+	return a.inspected
 }
 
 // learnerStatus asks every learner that has a client URL for its status.
@@ -561,6 +595,28 @@ func (a *Agent) rejoin(ctx context.Context, act engine.Action) *engine.Result {
 	if len(ms.Voters) != 1 {
 		return fail(fmt.Errorf("the survivor %s has %d voters, a rejoin needs it alone", survivor.Endpoint(), len(ms.Voters)))
 	}
+	// The survivor leads alone and does not list this member's current ID
+	// as a voter: a takeover removed this member after it was one. For a
+	// member whose etcd does not answer this is the proof that it is stale,
+	// since its generation key cannot be read.
+	if act.Self != 0 && ms.Voters[0].ID == act.Self {
+		return fail(fmt.Errorf("the survivor %s is this member, %s", survivor.Endpoint(), engine.Hex(act.Self)))
+	}
+	if act.Self != 0 && slices.ContainsFunc(ms.Learners, func(m engine.Member) bool { return m.ID == act.Self }) {
+		// The log already carries the learner's ID: an earlier attempt
+		// finished the edit, and only etcd's restart is missing.
+		r.Learner = act.Self
+		a.logger.Info("rejoin: this member is already the survivor's learner, waiting for etcd", "learner", engine.Hex(act.Self))
+		if err := a.proc.Resume(ctx); err != nil {
+			return fail(err)
+		}
+		if err := a.waitForEtcd(ctx, "rejoin"); err != nil {
+			return fail(err)
+		}
+		delete(a.lastLog, "rejoin")
+		a.metrics.rejoins.WithLabelValues("success").Inc()
+		return r
+	}
 	learner := uint64(0)
 	for _, l := range ms.Learners {
 		if sameURLs(l.PeerURLs, act.PeerURLs) {
@@ -679,6 +735,7 @@ func (a *Agent) withStopped(ctx context.Context, what string, op func() error) e
 // waitForEtcd polls the local member until it answers.
 func (a *Agent) waitForEtcd(ctx context.Context, what string) error {
 	deadline := time.Now().Add(a.restartTimeout)
+	logged := false
 	for {
 		a.markLoop()
 		sctx, cancel := context.WithTimeout(ctx, a.pollTimeout)
@@ -690,6 +747,12 @@ func (a *Agent) waitForEtcd(ctx context.Context, what string) error {
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("%s: etcd did not answer within %s: %w", what, a.restartTimeout, err)
+		}
+		if !logged {
+			// With a crash-looping etcd the platform's backoff decides when
+			// it starts again; that is not a failure.
+			a.logger.Info(what+": waiting for etcd to be started again by whoever runs it", "timeout", a.restartTimeout.String())
+			logged = true
 		}
 		select {
 		case <-ctx.Done():
