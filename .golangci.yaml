@@ -4,6 +4,7 @@ run:
   build-tags:
     - e2e
     - kubernetes
+    - policy
 
 linters:
   default: standard
