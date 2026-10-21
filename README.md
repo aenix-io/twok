@@ -2,7 +2,7 @@
 
 etcd on two members, with an external arbiter that breaks the tie.
 
-> **Status: research.** twok is an experiment in running etcd across two sites without a third member. It is not released and not meant for production. The design, the safety argument and the failure model are in [docs/design.md](docs/design.md); what was measured on a test bench is in [docs/testing.md](docs/testing.md). Read both before running it anywhere that matters.
+> **Status: research.** twok is an experiment in running etcd across two sites without a third member. It is not released and not meant for production. The design, the safety argument and the failure model are in [docs/design.md](docs/design.md); what was measured on a test bench is in [docs/testing.md](docs/testing.md); the report of the first round is [docs/report.md](docs/report.md). Read them before running it anywhere that matters.
 
 ## The problem
 
