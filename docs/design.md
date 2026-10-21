@@ -19,7 +19,7 @@ twok is a supervisor that runs the etcd process on each of the two members. It w
 
 The arbiter is involved only when the cluster has lost its leader. It is not on the write path, it stores a few hundred bytes, and it needs no low latency. It can be an S3 bucket, another etcd cluster, a Kubernetes API server, or any HTTP service that implements the contract in [Arbiter backends](#arbiter-backends).
 
-This is the mechanism Red Hat ships in two-node OpenShift with fencing, with one difference. Red Hat fences the other node through its BMC before the survivor reconfigures etcd, and that fencing both breaks the tie and stops the other node. twok breaks the tie with the arbiter and relies on Raft to stop the other node's etcd, which it does by construction: a voter without a quorum commits nothing. twok fences etcd, not the node. Workloads and storage on the losing node are out of scope; see [What is not covered](#what-is-not-covered).
+This is the mechanism Red Hat ships in two-node OpenShift with fencing, with one difference. Red Hat fences the other node through its BMC before the survivor reconfigures etcd, and that fencing both breaks the tie and stops the other node. twok breaks the tie with the arbiter and relies on Raft to stop the other node's etcd, which it does by construction: a voter without a quorum commits nothing. twok fences etcd, not the node. Workloads and storage on the losing node are out of scope; see [Failure model](#failure-model).
 
 ## The model
 
@@ -84,7 +84,7 @@ stateDiagram-v2
 
 **Solo.** The member won. It writes `{"generation": g+1, "role": "member"}` to its state file, stops etcd, marks every entry in its own log as committed (see [The follower's last entries](#the-followers-last-entries)), starts etcd once with `--force-new-cluster`, waits for it to lead a cluster of one, and restarts it without the flag. From then on it serves. twok does not renew anything in the arbiter: a cluster of one keeps its quorum until a second voter is added, and only twok adds one.
 
-**Stale.** The member lost. Its etcd is stopped, if it had not already exited: a removed member that reaches the survivor's peer port is told it was removed and exits by itself. twok sets the data directory aside (the `member` directory is renamed, and only the latest copy is kept), writes `{"generation": <arbiter's>, "role": "joining"}`, and goes to **Joining**.
+**Stale.** The member lost. Its etcd is stopped, if it had not already exited: a removed member that reaches the survivor's peer port is told it was removed (HTTP 410 on the peer stream) and exits, with exit code 0 and no marker on disk. twok does not parse that; on any etcd exit it reads the arbiter, and restarts etcd with a backoff while the arbiter cannot be reached. twok sets the data directory aside (the `member` directory is renamed, and only the latest copy is kept), writes `{"generation": <arbiter's>, "role": "joining"}`, and goes to **Joining**.
 
 **Joining.** twok waits until the survivor's client API answers, asks it to add the local member as a learner, and starts etcd with `--initial-cluster-state=existing` and an initial cluster of the two members. When the learner has caught up, twok asks the survivor to promote it. When the local member reports that it is a voter, twok writes `{"generation": g, "role": "member"}` and is back in **Pair**.
 
@@ -119,7 +119,7 @@ The property to prove: at any time, at most one etcd cluster derived from the or
 
 ### The follower's last entries
 
-A follower acknowledges an entry to the leader as soon as it is in its log. The leader commits it, answers the client, and tells the follower about the new commit index in its next message, typically within one heartbeat interval (100 ms by default). If the partition hits in between, the follower holds an acknowledged entry that it does not know is committed. etcd's `--force-new-cluster` discards entries after the member's commit index, so a follower that becomes the survivor would lose it.
+A follower acknowledges an entry to the leader as soon as it is in its log. The leader commits it, answers the client, and tells the follower about the new commit index in its next message to it. If the partition hits in between, the follower holds an acknowledged entry that it does not know is committed, and it never learns. etcd's `--force-new-cluster` discards entries after the member's commit index, so a follower that becomes the survivor would lose it. Two details make the window wider than a heartbeat: the leader's notification is one message, lost with the partition, and the commit index alone is written to the WAL without a sync, so even a notification that arrived may not be on disk when the follower is killed. The fix in etcd 3.5.22 and 3.6.1, which keeps entries up to the applied index, does not cover this case: a follower cannot apply what it does not know is committed. The sources are in the research notes under [docs/research/](research/).
 
 twok closes this window. Before it runs `--force-new-cluster`, it rewrites the hard state in the member's WAL so that the commit index equals the last index of the log. This is safe in a two-voter cluster and only there:
 
@@ -185,6 +185,15 @@ Link A-B breaks at T, A was the leader, both reach the arbiter:
 | T + 30 s | A's etcd has been restarted twice and serves as a cluster of one |
 
 The numbers are starting points. Red Hat waits minutes before fencing to ride out short outages; the right value depends on the links.
+
+## etcd versions
+
+twok talks to etcd through the client API and touches the data directory only with etcd's own WAL package, whose format is the same in 3.5 and 3.6. The tests run against the newest 3.5 and the newest 3.6.
+
+Two etcd bugs matter for the takeover and the rejoin, and both are avoided or fixed in newer patch releases:
+
+- Before 3.5.20 a learner's promotion was stored only in the v2 store, and the member becomes a learner again on an upgrade to 3.6. Run 3.5.20 or later.
+- Before 3.5.25 `--force-new-cluster` does not remove a learner that is already in a snapshot, and the removal of the other member may not reach the backend when the applied index is ahead of the commit index. twok writes the commit index at the last entry before the restart, which puts it ahead of the applied index and avoids the second case; the first case does not occur in twok's flows, where a learner exists only while the survivor is already alone.
 
 ## Configuration
 
