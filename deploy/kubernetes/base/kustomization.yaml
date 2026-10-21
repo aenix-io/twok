@@ -5,9 +5,15 @@ resources:
   - service.yaml
   - statefulset.yaml
   - pdb.yaml
-# The one place where the member image is set. Pin it by digest for anything
-# that matters, for example newTag: v3.6.15-main@sha256:<digest>.
+# The one place where the images are set.
 images:
-  - name: twok-etcd
-    newName: ghcr.io/aenix-io/twok-etcd
-    newTag: v3.6.15-main
+  # gcr.io/etcd-development/etcd:v3.6.15, the multi-arch index digest, read
+  # from the registry on 2026-10-21.
+  - name: etcd
+    newName: gcr.io/etcd-development/etcd
+    digest: sha256:5ed4e32061aa061f970d6500629213e8579ef17571dcf9789074966acb9afad1
+  # The development tag moves with every push to main; pin a digest for
+  # anything that should stay put, for example newTag: main@sha256:<digest>.
+  - name: twok
+    newName: ghcr.io/aenix-io/twok
+    newTag: main

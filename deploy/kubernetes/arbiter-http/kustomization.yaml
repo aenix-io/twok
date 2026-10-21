@@ -7,8 +7,16 @@ resources:
   - arbiter.yaml
 patches:
   - path: members.yaml
-# The one place where the arbiter image is set.
-images:
-  - name: twok
-    newName: ghcr.io/aenix-io/twok
-    newTag: main
+# The arbiter runs the same twok image as the members' sidecar, taken from
+# the StatefulSet so that the image is still set in one place, the base.
+replacements:
+  - source:
+      kind: StatefulSet
+      name: etcd
+      fieldPath: spec.template.spec.initContainers.[name=twok].image
+    targets:
+      - select:
+          kind: Deployment
+          name: arbiter
+        fieldPaths:
+          - spec.template.spec.containers.[name=arbiter].image

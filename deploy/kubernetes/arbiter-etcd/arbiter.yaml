@@ -5,8 +5,8 @@ metadata:
 spec:
   template:
     spec:
-      containers:
-        - name: etcd
+      initContainers:
+        - name: twok
           env:
             - name: TWOK_ARBITER
               value: etcd://arbiter-client:2379/twok/etcd

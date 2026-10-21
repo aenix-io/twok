@@ -7,8 +7,8 @@ spec:
     spec:
       serviceAccountName: twok
       automountServiceAccountToken: true
-      containers:
-        - name: etcd
+      initContainers:
+        - name: twok
           env:
             - name: TWOK_ARBITER
               value: kubernetes://$(NAMESPACE)/twok-arbiter
