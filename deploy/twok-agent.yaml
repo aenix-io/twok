@@ -75,6 +75,15 @@ spec:
         has(object.metadata.annotations) && "twok.aenix.io/arbiter" in object.metadata.annotations
         ? ["--arbiter=" + object.metadata.annotations["twok.aenix.io/arbiter"]]
         : []
+    # The headless Service of the member Pods, from the Pod's subdomain,
+    # resolves to every member. A member that lost the takeover finds the
+    # survivor through it when it has no member list to go by.
+    - name: peerEndpoints
+      expression: >-
+        has(object.spec.subdomain) && object.spec.subdomain != ""
+        ? ["--peer-endpoints=" + (variables.clientTLS ? "https" : "http") + "://" +
+           object.spec.subdomain + "." + request.namespace + ".svc:2379"]
+        : []
     # The agent's flags; the same names as in deploy/kubernetes/base.
     - name: args
       expression: >-
@@ -84,7 +93,7 @@ spec:
           "--data-dir=" + variables.dataDir,
           "--config-dir=/etc/twok",
           "--metrics-listen=:2390",
-        ] +
+        ] + variables.peerEndpoints +
         (variables.clientTLS ? [
           "--cert-file=/etc/etcd/tls/client/tls.crt",
           "--key-file=/etc/etcd/tls/client/tls.key",

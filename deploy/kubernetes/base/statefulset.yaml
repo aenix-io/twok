@@ -72,6 +72,10 @@ spec:
             - --data-dir=/var/lib/etcd
             - --config-dir=/etc/twok
             - --metrics-listen=:2390
+            # The headless Service resolves to both members. A member that
+            # lost the takeover finds the survivor through it when it has
+            # no member list to go by.
+            - --peer-endpoints=http://etcd.$(NAMESPACE).svc:2379
           env:
             # Set by the arbiter overlay. An env entry rather than a
             # ConfigMap key so that it can refer to $(NAMESPACE).
