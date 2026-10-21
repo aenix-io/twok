@@ -86,4 +86,4 @@ All measurements are in [testing.md](testing.md) with the commands and the raw r
 
 - Repository: <https://github.com/aenix-io/twok>, `main`.
 - Design: [design.md](design.md). Decisions: [decisions.md](decisions.md). Measurements: [testing.md](testing.md). Research notes: [research/](research/).
-- Pull requests, in order: #1 design, #2 research notes, #3 and #5 delivery, #4 core and scaffolding, #6 backends, #7 Kubernetes bench, #8 etcd client and WAL operations, #9 experiment results, #10 engine, agent and CLI, #11 documentation cleanup, #12 container end-to-end tests and the policy job, #13 the Kubernetes runs, #14 the rejoin fix, #15 the one-way rerun.
+- Pull requests, in order: #1 design, #2 research notes, #3 and #5 delivery, #4 core and scaffolding, #6 backends, #7 Kubernetes bench, #8 etcd client and WAL operations, #9 experiment results, #10 engine, agent and CLI, #11 documentation cleanup, #12 container end-to-end tests and the policy job, #13 the Kubernetes runs, #14 the rejoin fix, #15 the one-way rerun, #16 the survivor found through a DNS name, #17 this report.

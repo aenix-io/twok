@@ -9,6 +9,7 @@ It is based on the operator at v0.5.4, API `etcd-operator.cozystack.io/v1alpha2`
 The same way threek does: a MutatingAdmissionPolicy in `deploy/twok-agent.yaml` adds a native sidecar to member Pods labelled `twok.aenix.io/inject: "true"`, through `spec.additionalMetadata.labels`.
 Besides what threek's policy does, twok's mounts the member's `data` volume into the sidecar and sets `shareProcessNamespace: true` on the Pod, so the sidecar can find and stop the etcd process; both are Pod fields the policy may set, and the operator keeps building the Pod as it does.
 The policy needs Kubernetes 1.36, or 1.35 with the `MutatingAdmissionPolicy` feature gate, which is why the test bench on a 1.33 cluster runs the same Pod layout as a StatefulSet instead.
+The sidecar finds the survivor through the member's headless Service, `<subdomain>.<namespace>.svc`, which the policy passes as `--peer-endpoints`; with TLS that name has to be in the server certificate, and the operator issues it that way (checked on a v0.5.4 cluster: the SANs include `etcd.<namespace>.svc` and `*.etcd.<namespace>.svc`).
 
 ## What the operator does badly with a cluster twok reconfigures
 
