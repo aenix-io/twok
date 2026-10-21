@@ -3,6 +3,7 @@ package etcdargs
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
@@ -50,38 +51,6 @@ func TestParseOperator(t *testing.T) {
 		Raw: cmd,
 	}
 	expectArgs(t, a, want)
-	// Nothing changes without overrides.
-	if got := a.With(); !slices.Equal(got, cmd) {
-		t.Errorf("With() = %q, want the command line unchanged", got)
-	}
-}
-
-func TestWithOperator(t *testing.T) {
-	cmd := operatorArgs(t)
-	a, err := Parse(cmd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pair := "etcd-f5sw9=https://etcd-f5sw9.etcd.cozy-freedom.svc:2380,etcd-x2k4p=https://etcd-x2k4p.etcd.cozy-freedom.svc:2380"
-	got := a.With(InitialCluster(pair), InitialClusterState("existing"))
-	want := slices.Clone(cmd)
-	for i, arg := range want {
-		switch {
-		case strings.HasPrefix(arg, "--initial-cluster="):
-			want[i] = "--initial-cluster=" + pair
-		case strings.HasPrefix(arg, "--initial-cluster-state="):
-			want[i] = "--initial-cluster-state=existing"
-		}
-	}
-	if !slices.Equal(got, want) {
-		t.Errorf("With() =\n%q\nwant\n%q", got, want)
-	}
-
-	got = a.With(ForceNewCluster(true))
-	want = append(slices.Clone(cmd), "--force-new-cluster")
-	if !slices.Equal(got, want) {
-		t.Errorf("With(ForceNewCluster(true)) =\n%q\nwant\n%q", got, want)
-	}
 }
 
 func TestParseDefaults(t *testing.T) {
@@ -182,6 +151,11 @@ func TestParseForms(t *testing.T) {
 			check: func(a Args) bool { return !a.PeerTLS.ClientCertAuth && !a.ForceNewCluster },
 		},
 		{
+			name:  "force-new-cluster is reported, not refused",
+			cmd:   []string{"etcd", "--force-new-cluster"},
+			check: func(a Args) bool { return a.ForceNewCluster },
+		},
+		{
 			name:  "value that starts with a dash",
 			cmd:   []string{"etcd", "--initial-cluster-token", "-x-", "--name=a"},
 			check: func(a Args) bool { return a.Name == "a" },
@@ -230,8 +204,8 @@ func TestParseRejects(t *testing.T) {
 		{name: "bad cluster state", cmd: []string{"etcd", "--initial-cluster-state=old"}, want: []string{"want new or existing"}},
 		{
 			name: "every unsupported flag is listed",
-			cmd:  []string{"etcd", "--config-file=/etc/etcd.yaml", "--auto-tls", "--peer-auto-tls=true", "--force-new-cluster"},
-			want: []string{"--config-file", "--auto-tls", "--peer-auto-tls", "--force-new-cluster"},
+			cmd:  []string{"etcd", "--config-file=/etc/etcd.yaml", "--auto-tls", "--peer-auto-tls=true"},
+			want: []string{"--config-file", "--auto-tls", "--peer-auto-tls"},
 		},
 	}
 	for _, tt := range tests {
@@ -249,67 +223,6 @@ func TestParseRejects(t *testing.T) {
 	}
 }
 
-func TestWith(t *testing.T) {
-	tests := []struct {
-		name string
-		cmd  []string
-		opts []Override
-		want []string
-	}{
-		{
-			name: "replace in place, separate value form",
-			cmd:  []string{"etcd", "--name", "a", "--initial-cluster", "a=http://a:2380", "--initial-cluster-state", "new", "--data-dir", "/d"},
-			opts: []Override{InitialCluster("a=http://a:2380,b=http://b:2380"), InitialClusterState("existing")},
-			want: []string{"etcd", "--name", "a", "--initial-cluster=a=http://a:2380,b=http://b:2380", "--initial-cluster-state=existing", "--data-dir", "/d"},
-		},
-		{
-			name: "repeated flag replaced once, at its first place",
-			cmd:  []string{"etcd", "--initial-cluster=x=http://x:2380", "--name=a", "-initial-cluster", "a=http://a:2380"},
-			opts: []Override{InitialCluster("a=http://a:2380")},
-			want: []string{"etcd", "--initial-cluster=a=http://a:2380", "--name=a"},
-		},
-		{
-			name: "absent flags appended",
-			cmd:  []string{"etcd", "--name=a"},
-			opts: []Override{ForceNewCluster(true), InitialClusterState("existing"), InitialCluster("a=http://a:2380")},
-			want: []string{"etcd", "--name=a", "--initial-cluster=a=http://a:2380", "--initial-cluster-state=existing", "--force-new-cluster"},
-		},
-		{
-			name: "force-new-cluster removed in every form",
-			cmd:  []string{"etcd", "--force-new-cluster=false", "--name=a", "-force-new-cluster=false"},
-			opts: []Override{ForceNewCluster(false)},
-			want: []string{"etcd", "--name=a"},
-		},
-		{
-			name: "force-new-cluster added at its place",
-			cmd:  []string{"etcd", "--force-new-cluster=false", "--name=a"},
-			opts: []Override{ForceNewCluster(true)},
-			want: []string{"etcd", "--force-new-cluster", "--name=a"},
-		},
-		{
-			name: "unrelated flags and terminator kept",
-			cmd:  []string{"etcd", "--client-cert-auth", "--snapshot-count", "10000", "--"},
-			opts: []Override{InitialClusterState("existing")},
-			want: []string{"etcd", "--client-cert-auth", "--snapshot-count", "10000", "--", "--initial-cluster-state=existing"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			a, err := Parse(tt.cmd)
-			if err != nil {
-				t.Fatalf("Parse() error = %v", err)
-			}
-			if got := a.With(tt.opts...); !slices.Equal(got, tt.want) {
-				t.Errorf("With() =\n%q\nwant\n%q", got, tt.want)
-			}
-			// With never changes the parsed command line.
-			if !slices.Equal(a.Raw, tt.cmd) {
-				t.Errorf("Raw = %q after With(), want %q", a.Raw, tt.cmd)
-			}
-		})
-	}
-}
-
 func TestInitialCluster(t *testing.T) {
 	s := "a=https://10.0.0.1:2380,b=https://10.0.0.2:2380,a=https://a.example:2380"
 	members, err := ParseInitialCluster(s)
@@ -322,9 +235,6 @@ func TestInitialCluster(t *testing.T) {
 	}
 	if !reflect.DeepEqual(members, want) {
 		t.Errorf("ParseInitialCluster() = %+v, want %+v", members, want)
-	}
-	if got, want := FormatInitialCluster(members), "a=https://10.0.0.1:2380,a=https://a.example:2380,b=https://10.0.0.2:2380"; got != want {
-		t.Errorf("FormatInitialCluster() = %q, want %q", got, want)
 	}
 	for _, bad := range []string{"", "a", "=http://a:2380", "a="} {
 		if _, err := ParseInitialCluster(bad); err == nil {
@@ -362,5 +272,51 @@ func expectArgs(t *testing.T, got, want Args) {
 	got.flags = nil
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Parse() =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
+func TestFromCmdline(t *testing.T) {
+	cmd := operatorArgs(t)
+	// /proc/<pid>/cmdline ends every argument with a NUL byte.
+	data := []byte(strings.Join(cmd, "\x00") + "\x00")
+	a, err := FromCmdline(data)
+	if err != nil {
+		t.Fatalf("FromCmdline() error = %v", err)
+	}
+	if !slices.Equal(a.Raw, cmd) || a.Name != "etcd-f5sw9" {
+		t.Errorf("FromCmdline() = %+v, want the operator's command line", a)
+	}
+	// An argument may be empty, and must stay an argument of its own.
+	a, err = FromCmdline([]byte("etcd\x00--name\x00\x00--data-dir=/d\x00"))
+	if err != nil {
+		t.Fatalf("FromCmdline() with an empty argument error = %v", err)
+	}
+	if a.Name != "" || a.DataDir != "/d" {
+		t.Errorf("FromCmdline() = name %q, data dir %q, want an empty name and /d", a.Name, a.DataDir)
+	}
+	for _, empty := range [][]byte{nil, {0}} {
+		if _, err := FromCmdline(empty); err == nil {
+			t.Errorf("FromCmdline(%q) succeeded, want an error", empty)
+		}
+	}
+}
+
+func TestFromProc(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "42"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "42", "cmdline"), []byte("/usr/local/bin/etcd\x00--name=a\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := FromProc(root, 42)
+	if err != nil {
+		t.Fatalf("FromProc() error = %v", err)
+	}
+	if a.Binary != "/usr/local/bin/etcd" || a.Name != "a" || a.DataDir != "a.etcd" {
+		t.Errorf("FromProc() = %+v", a)
+	}
+	if _, err := FromProc(root, 43); err == nil {
+		t.Error("FromProc() of a missing process succeeded")
 	}
 }

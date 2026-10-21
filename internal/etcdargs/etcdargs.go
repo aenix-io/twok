@@ -1,25 +1,29 @@
-// Package etcdargs reads the etcd command line twok supervises and writes
-// the variants twok needs for a takeover and a rejoin.
+// Package etcdargs reads the configuration of the local etcd member from its
+// command line.
 //
-// twok is given the etcd command line as it would run without twok: the
-// etcd binary first, then flags in the forms etcd's flag parser accepts,
-// --flag=value, --flag value and -flag, with the last of repeated flags
-// winning. twok learns the member's name, data directory, URLs and TLS
-// files from it, and changes nothing in it except --initial-cluster,
-// --initial-cluster-state and --force-new-cluster.
+// twok runs next to etcd, as a sidecar container in a Pod that shares the
+// process namespace or as a static Pod on the same host, and reads etcd's
+// command line from /proc/<pid>/cmdline. That gives it the member's name,
+// data directory, URLs and TLS files with no configuration of its own, and
+// it never changes the command line.
+//
+// The command line is read as etcd's flag parser reads it: the etcd binary
+// first, then flags as --flag=value, --flag value or -flag, with the last of
+// repeated flags winning, and etcd's defaults for absent flags.
 //
 // Configuration that does not come from the command line is out of scope.
 // etcd also reads every flag from an ETCD_<FLAG> environment variable and
 // from a --config-file; twok reads neither, so a member configured that way
-// would be seen with etcd's defaults. --config-file is refused because twok
-// cannot rewrite it. Environment variables are not checked, because
-// container runtimes set ETCD_* variables of their own; keep the etcd
-// configuration in flags.
+// would be seen with etcd's defaults. --config-file is refused for that
+// reason. Environment variables are not checked, because container runtimes
+// set ETCD_* variables of their own; keep the etcd configuration in flags.
 package etcdargs
 
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,13 +36,6 @@ const (
 	DefaultPeerURL             = "http://localhost:2380"
 	DefaultInitialClusterState = "new"
 	defaultInitialCluster      = DefaultName + "=" + DefaultPeerURL
-)
-
-// Flags twok rewrites.
-const (
-	flagInitialCluster      = "initial-cluster"
-	flagInitialClusterState = "initial-cluster-state"
-	flagForceNewCluster     = "force-new-cluster"
 )
 
 // boolFlags are etcd's boolean flags, from etcd --help of v3.5, v3.6 and
@@ -117,23 +114,19 @@ type Args struct {
 	// Raw is the command line as given, binary first.
 	Raw []string
 
-	// flags are the parsed flags in order, with the arguments they came
-	// from.
+	// flags are the parsed flags in order.
 	flags []flag
 }
 
-// flag is one flag occurrence and the range of Raw it occupies.
+// flag is one flag occurrence.
 type flag struct {
 	name  string
 	value string
-	// start and end index Raw: the flag is Raw[start:end], one argument or
-	// two.
-	start, end int
 }
 
 // Parse reads an etcd command line, binary first. It returns an error for
 // a command line etcd would reject as malformed, and for configuration twok
-// cannot work with, listing every such flag.
+// cannot learn from it or cannot work with, listing every such flag.
 func Parse(cmd []string) (Args, error) {
 	if len(cmd) == 0 {
 		return Args{}, errors.New("etcd command line is empty")
@@ -152,7 +145,7 @@ func Parse(cmd []string) (Args, error) {
 		if err != nil {
 			return Args{}, err
 		}
-		f := flag{name: name, start: i, end: i + 1}
+		f := flag{name: name}
 		switch {
 		case hasValue:
 			f.value = value
@@ -160,7 +153,7 @@ func Parse(cmd []string) (Args, error) {
 			f.value = "true"
 		case i+1 < len(cmd):
 			i++
-			f.value, f.end = cmd[i], i+1
+			f.value = cmd[i]
 		default:
 			return Args{}, fmt.Errorf("flag needs an argument: %s", arg)
 		}
@@ -234,7 +227,7 @@ func (a *Args) resolve() error {
 	a.AdvertiseClientURLs = urls("advertise-client-urls", DefaultClientURL)
 	a.ListenPeerURLs = urls("listen-peer-urls", DefaultPeerURL)
 	a.InitialAdvertisePeerURLs = urls("initial-advertise-peer-urls", DefaultPeerURL)
-	a.InitialCluster = str(flagInitialCluster, defaultInitialCluster)
+	a.InitialCluster = str("initial-cluster", defaultInitialCluster)
 	if a.InitialCluster == defaultInitialCluster && a.Name != DefaultName {
 		members := make([]string, 0, len(a.InitialAdvertisePeerURLs))
 		for _, u := range a.InitialAdvertisePeerURLs {
@@ -242,8 +235,8 @@ func (a *Args) resolve() error {
 		}
 		a.InitialCluster = strings.Join(members, ",")
 	}
-	a.InitialClusterState = str(flagInitialClusterState, DefaultInitialClusterState)
-	a.ForceNewCluster = boolean(flagForceNewCluster)
+	a.InitialClusterState = str("initial-cluster-state", DefaultInitialClusterState)
+	a.ForceNewCluster = boolean("force-new-cluster")
 	a.ClientTLS = TLS{
 		CertFile:       str("cert-file", ""),
 		KeyFile:        str("key-file", ""),
@@ -258,16 +251,13 @@ func (a *Args) resolve() error {
 	}
 
 	if v := str("config-file", ""); v != "" {
-		problems = append(problems, "--config-file: twok cannot read or rewrite an etcd configuration file, pass the flags instead")
+		problems = append(problems, "--config-file: twok does not read etcd configuration files, pass the flags instead")
 	}
 	if boolean("auto-tls") {
-		problems = append(problems, "--auto-tls: twok cannot authenticate to self-signed certificates it never sees, pass --cert-file and --key-file")
+		problems = append(problems, "--auto-tls: twok cannot trust self-signed certificates it never sees, pass --cert-file and --key-file")
 	}
 	if boolean("peer-auto-tls") {
-		problems = append(problems, "--peer-auto-tls: a member rebuilt by twok could not prove its peer identity, pass --peer-cert-file and --peer-key-file")
-	}
-	if a.ForceNewCluster {
-		problems = append(problems, "--force-new-cluster: twok adds it for one start during a takeover; kept on every start it would remove a joining member again")
+		problems = append(problems, "--peer-auto-tls: twok cannot trust self-signed peer certificates it never sees, pass --peer-cert-file and --peer-key-file")
 	}
 	switch a.InitialClusterState {
 	case "new", "existing":
@@ -280,103 +270,14 @@ func (a *Args) resolve() error {
 	return nil
 }
 
-// Override changes one flag in a command line built by With.
-type Override func(*overrides)
-
-type overrides struct {
-	initialCluster      *string
-	initialClusterState *string
-	forceNewCluster     *bool
-}
-
-// InitialCluster sets --initial-cluster.
-func InitialCluster(v string) Override {
-	return func(o *overrides) { o.initialCluster = &v }
-}
-
-// InitialClusterState sets --initial-cluster-state, "new" or "existing".
-func InitialClusterState(v string) Override {
-	return func(o *overrides) { o.initialClusterState = &v }
-}
-
-// ForceNewCluster adds --force-new-cluster when on and removes every
-// occurrence of it when off.
-//
-// etcd v3.5.34, v3.6.15 and v3.7.2 have no --force-new-cluster-bump-amount;
-// the revision bump exists only in etcdutl snapshot restore. twok therefore
-// adds no such flag.
-func ForceNewCluster(on bool) Override {
-	return func(o *overrides) { o.forceNewCluster = &on }
-}
-
-// With returns a new command line, binary first, with the overrides
-// applied and every other argument kept as it was, in its order. An
-// overridden flag takes the place of its first occurrence, and its other
-// occurrences are dropped, which is what etcd's last-wins rule makes of
-// them anyway. A flag that was absent is appended at the end.
-func (a Args) With(opts ...Override) []string {
-	var o overrides
-	for _, opt := range opts {
-		opt(&o)
-	}
-	replacement := map[string]*string{}
-	if o.initialCluster != nil {
-		replacement[flagInitialCluster] = o.initialCluster
-	}
-	if o.initialClusterState != nil {
-		replacement[flagInitialClusterState] = o.initialClusterState
-	}
-	var force *string
-	if o.forceNewCluster != nil {
-		if *o.forceNewCluster {
-			s := ""
-			force = &s
-		}
-		replacement[flagForceNewCluster] = force
-	}
-
-	out := []string{a.Binary}
-	emitted := map[string]bool{}
-	emit := func(name string) {
-		emitted[name] = true
-		v := replacement[name]
-		switch {
-		case v == nil:
-			// Removed.
-		case name == flagForceNewCluster:
-			out = append(out, "--"+name)
-		default:
-			out = append(out, "--"+name+"="+*v)
-		}
-	}
-	next := 1
-	for _, f := range a.flags {
-		out = append(out, a.Raw[next:f.start]...)
-		next = f.end
-		if _, overridden := replacement[f.name]; !overridden {
-			out = append(out, a.Raw[f.start:f.end]...)
-			continue
-		}
-		if !emitted[f.name] {
-			emit(f.name)
-		}
-	}
-	out = append(out, a.Raw[next:]...)
-	for _, name := range []string{flagInitialCluster, flagInitialClusterState, flagForceNewCluster} {
-		if _, overridden := replacement[name]; overridden && !emitted[name] {
-			emit(name)
-		}
-	}
-	return out
-}
-
 // Member is one entry of --initial-cluster.
 type Member struct {
 	Name     string
 	PeerURLs []string
 }
 
-// ParseInitialCluster reads an --initial-cluster value. A member with
+// ParseInitialCluster reads an --initial-cluster value, the members etcd
+// was bootstrapped or joined with. A member with
 // several peer URLs is listed once per URL in etcd's format and comes back
 // as one Member, in the order of first appearance.
 func ParseInitialCluster(s string) ([]Member, error) {
@@ -398,13 +299,28 @@ func ParseInitialCluster(s string) ([]Member, error) {
 	return members, nil
 }
 
-// FormatInitialCluster writes members as an --initial-cluster value.
-func FormatInitialCluster(members []Member) string {
-	var entries []string
-	for _, m := range members {
-		for _, u := range m.PeerURLs {
-			entries = append(entries, m.Name+"="+u)
-		}
+// FromCmdline reads the content of /proc/<pid>/cmdline: the arguments,
+// each ended by a NUL byte.
+func FromCmdline(data []byte) (Args, error) {
+	s := strings.TrimSuffix(string(data), "\x00")
+	if s == "" {
+		// A kernel thread, or a process that has already exited.
+		return Args{}, errors.New("etcd command line is empty")
 	}
-	return strings.Join(entries, ",")
+	return Parse(strings.Split(s, "\x00"))
+}
+
+// FromProc reads the command line of the process pid under procRoot, which
+// is "/proc" outside tests.
+func FromProc(procRoot string, pid int) (Args, error) {
+	path := filepath.Join(procRoot, strconv.Itoa(pid), "cmdline")
+	data, err := os.ReadFile(path) // #nosec G304 -- a file under /proc
+	if err != nil {
+		return Args{}, err
+	}
+	a, err := FromCmdline(data)
+	if err != nil {
+		return Args{}, fmt.Errorf("%s: %w", path, err)
+	}
+	return a, nil
 }
