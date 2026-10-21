@@ -76,6 +76,41 @@ jobs:
             VERSION=ci
           push: false
 
+  image-etcd:
+    runs-on: ubuntu-latest
+    needs: etcd-versions
+    strategy:
+      fail-fast: false
+      matrix:
+        etcd: ${{ fromJSON(needs.etcd-versions.outputs.versions) }}
+    name: image-etcd (etcd ${{ matrix.etcd }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: pin
+        name: Look up the pinned etcd image
+        env:
+          ETCD_VERSION: ${{ matrix.etcd }}
+        run: |
+          image=$(awk -v version="${ETCD_VERSION}" '$1 == version { print $2 }' build/etcd.images)
+          if [[ -z "${image}" ]]; then
+            echo "etcd ${ETCD_VERSION} is in build/etcd.sha256 but not pinned in build/etcd.images" >&2
+            exit 1
+          fi
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "version=${ETCD_VERSION#v}" >> "${GITHUB_OUTPUT}"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build for every release platform
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Containerfile.etcd
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=ci
+            ETCD_VERSION=${{ steps.pin.outputs.version }}
+            ETCD_IMAGE=${{ steps.pin.outputs.image }}
+          push: false
+
   markdown:
     runs-on: ubuntu-latest
     steps:
