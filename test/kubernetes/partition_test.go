@@ -3,7 +3,6 @@
 package kubernetes
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -23,14 +22,47 @@ import (
 // still be in flight.
 const settle = 3 * time.Second
 
+// scenario is one partition run.
+type scenario struct {
+	policies []string
+	// winner is the member expected to become the survivor with twok:
+	// lastLeader, a member name, or "" for no expectation.
+	winner string
+	// restartSurvivor deletes the survivor's Pod once it serves alone, and
+	// removes the partition at the same moment.
+	restartSurvivor bool
+	// leader, when set, is made the Raft leader before the partition.
+	leader string
+}
+
+const lastLeader = "the last leader"
+
 // TestPartition cuts the two members from each other in both directions.
 func TestPartition(t *testing.T) {
-	runPartition(t, "manifests/partition.yaml")
+	runPartition(t, scenario{policies: []string{"manifests/partition.yaml"}, winner: lastLeader})
 }
 
 // TestPartitionOneWay cuts the connections from etcd-0 to etcd-1 only.
 func TestPartitionOneWay(t *testing.T) {
-	runPartition(t, "manifests/partition-one-way.yaml")
+	runPartition(t, scenario{policies: []string{"manifests/partition-one-way.yaml"}})
+}
+
+// TestPartitionArbiterCut makes etcd-1 the leader, then cuts the members
+// apart and etcd-1 from the arbiter: etcd-0, the follower, must win.
+func TestPartitionArbiterCut(t *testing.T) {
+	if cfg.baseline() {
+		t.Skip("no arbiter in the baseline")
+	}
+	runPartition(t, scenario{policies: []string{"manifests/partition.yaml", "manifests/cut-arbiter.yaml"}, winner: "etcd-0", leader: "etcd-1"})
+}
+
+// TestSurvivorRestart deletes the survivor's Pod while the loser has not
+// rejoined; the loser must stay out until the survivor is back.
+func TestSurvivorRestart(t *testing.T) {
+	if cfg.baseline() {
+		t.Skip("no survivor in the baseline")
+	}
+	runPartition(t, scenario{policies: []string{"manifests/partition.yaml"}, winner: lastLeader, restartSurvivor: true})
 }
 
 type put struct {
@@ -48,12 +80,12 @@ type status struct {
 
 func ms(t time.Time) int64 { return t.UnixMilli() }
 
-func runPartition(t *testing.T, policy string) {
+func runPartition(t *testing.T, sc scenario) {
 	e := &env{t: t, log: &bytes.Buffer{}}
 	e.logf("# %s, %s", t.Name(), time.Now().UTC().Format(time.RFC3339))
 	e.logf("mode: %s", cfg.mode())
-	e.logf("namespace: %s, partition for %s, watch for at least %s and at most %s after the heal, policy %s",
-		cfg.namespace, cfg.partitionFor, cfg.healFor, cfg.healTimeout, policy)
+	e.logf("namespace: %s, partition for %s, watch for at least %s and at most %s after the heal, policies %s",
+		cfg.namespace, cfg.partitionFor, cfg.healFor, cfg.healTimeout, strings.Join(sc.policies, ", "))
 
 	membersManifest := e.membersManifest()
 	var helpers []string
@@ -105,29 +137,72 @@ func runPartition(t *testing.T, policy string) {
 	}
 	e.waitForPuts(10)
 	e.snapshot("before the partition")
+	ids, leaderID := e.memberIDs()
+	if sc.leader != "" && ids[leaderID] != sc.leader {
+		e.moveLeader(ids, ids[leaderID], sc.leader)
+		ids, leaderID = e.memberIDs()
+	}
+	expected := sc.winner
+	if expected == lastLeader {
+		expected = ids[leaderID]
+	}
+	e.logf("members %v, leader before the partition %s (%s)", ids, ids[leaderID], leaderID)
 
 	// 3. Partition.
 	monitor := e.startPolicyMonitor(nodes["etcd-0"], cfg.partitionFor)
 	tApply := time.Now()
-	e.applyFile(policy)
+	for _, p := range sc.policies {
+		e.applyFile(p)
+	}
 	e.logf("partition applied at %s", tApply.UTC().Format(time.RFC3339Nano))
 	e.enforcement(nodes["etcd-0"], "etcd-0")
-	time.Sleep(cfg.partitionFor / 2)
-	e.snapshot("during the partition")
-	time.Sleep(time.Until(tApply.Add(cfg.partitionFor)))
+	var tHeal time.Time
+	if sc.restartSurvivor {
+		survivor := e.waitForSurvivor(tApply, cfg.partitionFor+time.Minute)
+		if survivor == "" {
+			e.t.FailNow()
+		}
+		e.snapshot("during the partition, survivor serving")
+		e.twokStatuses()
+		tKill := time.Now()
+		e.must("delete", "pod", survivor, "--wait=false")
+		e.mark(ms(tKill), survivor+": Pod deleted")
+		tHeal = time.Now()
+		for _, p := range sc.policies {
+			e.deleteFile(p)
+		}
+		e.logf("survivor %s deleted at %s, partition removed at %s", survivor,
+			tKill.UTC().Format(time.RFC3339Nano), tHeal.UTC().Format(time.RFC3339Nano))
+		e.watchWhileSurvivorAway(survivor, tKill)
+	} else {
+		time.Sleep(cfg.partitionFor / 2)
+		e.snapshot("during the partition")
+		e.twokStatuses()
+		time.Sleep(time.Until(tApply.Add(cfg.partitionFor)))
 
-	// 4. Heal.
-	tHeal := time.Now()
-	e.deleteFile(policy)
-	e.logf("partition removed at %s", tHeal.UTC().Format(time.RFC3339Nano))
+		// 4. Heal.
+		tHeal = time.Now()
+		for _, p := range sc.policies {
+			e.deleteFile(p)
+		}
+		e.logf("partition removed at %s", tHeal.UTC().Format(time.RFC3339Nano))
+	}
 	time.Sleep(cfg.healFor)
 	e.waitHealed(tHeal, cfg.healTimeout)
 	e.snapshot("after the heal")
+	e.twokStatuses()
 	e.logf("## policy verdicts on %s (cilium-dbg monitor --type policy-verdict, deny lines)", nodes["etcd-0"])
 	for _, l := range monitor() {
 		e.logf("    %s", l)
 	}
-	e.etcdLogs(tApply.Add(-2 * time.Second))
+	e.restarts()
+	for _, m := range members {
+		e.containerLogs(m, "etcd", etcdLogKeywords)
+		if !cfg.baseline() {
+			e.containerLogs(m, "twok", twokLogKeywords)
+			e.twokEvents(m)
+		}
+	}
 
 	// 5. Collect and check.
 	puts := map[string][]put{}
@@ -136,34 +211,56 @@ func runPartition(t *testing.T, policy string) {
 	}
 	statuses := e.statuses(offsets["probe"])
 	final := e.finalKeys()
-	e.verify(puts, final, ms(tApply), ms(tHeal))
+	e.verify(puts, final, ms(tApply), ms(tHeal), expected)
 	e.timeline(puts, statuses, ms(tApply), ms(tHeal))
 }
 
-// claims are the volumes the members and the HTTP arbiter write to.
-var claims = []string{"data-etcd-0", "data-etcd-1", "arbiter-data"}
-
-// deleteMembers deletes the workloads, empties their volumes as the user that
-// wrote them, and then deletes everything else, the claims included.
+// deleteMembers stops the workloads, empties every claim in the namespace
+// as the user that wrote it, and then deletes everything else, the claims
+// included. The arbiter EtcdCluster is scaled to zero first: the operator
+// then deletes its Pod and keeps its claim, which is emptied like the
+// others before the cluster is deleted.
 func (e *env) deleteMembers(manifest string) {
 	e.t.Helper()
 	if _, err := e.kubectl("delete", "statefulset/etcd", "deployment/arbiter", "--ignore-not-found", "--wait=true"); err != nil {
 		e.t.Error(err)
 	}
-	if _, err := e.kubectl("wait", "--for=delete", "pod", "--selector", "app.kubernetes.io/name in (etcd,twok-arbiter)", "--timeout=2m"); err != nil {
+	if cfg.overlay == "arbiter-etcd" && !cfg.baseline() {
+		if _, err := e.kubectl("patch", "etcdclusters.etcd-operator.cozystack.io", "arbiter", "--type=merge",
+			"--patch", `{"spec":{"replicas":0}}`); err != nil {
+			e.t.Error(err)
+		}
+	}
+	if _, err := e.kubectl("wait", "--for=delete", "pod", "--selector",
+		"app.kubernetes.io/name in (etcd,twok-arbiter)", "--timeout=2m"); err != nil {
 		e.t.Error(err)
 	}
-	for _, c := range claims {
-		if _, err := e.kubectl("get", "pvc", c); err != nil {
-			continue
-		}
-		e.wipe(c)
+	if _, err := e.kubectl("wait", "--for=delete", "pod", "--selector",
+		"etcd-operator.cozystack.io/cluster=arbiter", "--timeout=3m"); err != nil {
+		e.t.Error(err)
+	}
+	out, err := e.kubectl("get", "pvc", "--output", "name")
+	if err != nil {
+		e.t.Error(err)
+	}
+	var pvcs []string
+	for _, name := range strings.Fields(out) {
+		pvc := strings.TrimPrefix(name, "persistentvolumeclaim/")
+		pvcs = append(pvcs, pvc)
+		e.wipe(pvc)
 	}
 	if err := e.deleteManifest(manifest); err != nil {
 		e.t.Error(err)
 	}
-	if _, err := e.kubectl("delete", "pvc", "data-etcd-0", "data-etcd-1", "--ignore-not-found", "--wait=true"); err != nil {
+	// twok's records in the kubernetes:// arbiter.
+	if _, err := e.kubectl("delete", "configmap", "twok-arbiter", "twok-arbiter.probe", "--ignore-not-found"); err != nil {
 		e.t.Error(err)
+	}
+	if len(pvcs) > 0 {
+		args := append([]string{"delete", "pvc", "--ignore-not-found", "--wait=true"}, pvcs...)
+		if _, err := e.kubectl(args...); err != nil {
+			e.t.Error(err)
+		}
 	}
 }
 
@@ -246,13 +343,13 @@ func (e *env) snapshot(when string) {
 			e.logf("%s: %s", m, strings.TrimSpace(out))
 		}
 		if !cfg.baseline() {
-			metrics, err := e.exec("probe", "/tools/busybox", "wget", "-q", "-O", "-", "http://"+m+".etcd:2390/metrics")
+			metrics, err := e.metrics(m)
 			if err != nil {
 				e.logf("%s twok metrics: %v", m, err)
 				continue
 			}
 			for _, l := range strings.Split(metrics, "\n") {
-				if strings.HasPrefix(l, "twok_") {
+				if strings.HasPrefix(l, "twok_") && !strings.HasSuffix(l, " 0") {
 					e.logf("%s %s", m, l)
 				}
 			}
@@ -343,59 +440,7 @@ func (e *env) enforcement(node, member string) {
 var etcdLogKeywords = []string{
 	"lost TCP streaming", "failed to reach the peer", "prober found high clock drift", "is starting a new election",
 	"became candidate", "lost leader", "elected leader", "became leader", "became follower", "peer became active",
-	"peer became inactive", "established TCP streaming", "dropped internal Raft message",
-}
-
-// etcdLogs logs the lines of each member's log since the given time that say
-// what Raft and the peer transport saw.
-func (e *env) etcdLogs(since time.Time) {
-	e.t.Helper()
-	for _, m := range members {
-		e.logf("## etcd log of %s since %s, filtered", m, since.UTC().Format(time.RFC3339))
-		out, err := e.kubectl("logs", m, "--since-time", since.UTC().Format(time.RFC3339))
-		if err != nil {
-			e.logf("%v", err)
-			continue
-		}
-		// Repeated messages, such as an election attempt every second,
-		// are folded into one line with a count.
-		const limit = 80
-		n, repeats := 0, 0
-		var prevMsg, prevTS string
-		flush := func() {
-			if repeats > 0 {
-				e.logf("    ... repeated %d more times until %s", repeats, prevTS)
-				repeats = 0
-			}
-		}
-		scanner := bufio.NewScanner(strings.NewReader(out))
-		scanner.Buffer(make([]byte, 1<<20), 1<<20)
-		for scanner.Scan() {
-			var line struct {
-				TS  string `json:"ts"`
-				Msg string `json:"msg"`
-			}
-			raw := scanner.Text()
-			if json.Unmarshal([]byte(raw), &line) != nil || !matchesAny(line.Msg, etcdLogKeywords) {
-				continue
-			}
-			if line.Msg == prevMsg {
-				repeats++
-				prevTS = line.TS
-				continue
-			}
-			flush()
-			prevMsg, prevTS = line.Msg, line.TS
-			if n < limit {
-				e.logf("    %s %s", line.TS, compact(raw))
-			}
-			n++
-		}
-		flush()
-		if n > limit {
-			e.logf("    ... %d more distinct lines", n-limit)
-		}
-	}
+	"peer became inactive", "established TCP streaming", "dropped internal Raft message", "removed", "exit", "fatal", "panic", "failed to", "rejected",
 }
 
 func matchesAny(s string, substrings []string) bool {
@@ -425,22 +470,38 @@ func (e *env) waitHealed(tHeal time.Time, timeout time.Duration) {
 			}
 			healed = healed && okSince
 		}
+		if healed && !cfg.baseline() {
+			restored, list := e.pairRestored()
+			if !restored {
+				healed = false
+			} else {
+				e.logf("member list: %s", list)
+			}
+		}
 		if healed {
 			e.logf("both members have a leader and both writers succeed again, %.1f s after the heal", time.Since(tHeal).Seconds())
+			e.mark(ms(time.Now()), "pair restored: both members have a leader, both writers succeed"+
+				map[bool]string{true: "", false: ", two voters"}[cfg.baseline()])
 			return
 		}
 		if time.Now().After(deadline) {
 			e.logf("the pair has not recovered %s after the heal", timeout)
+			if !cfg.baseline() {
+				e.t.Errorf("the pair has not recovered %s after the heal", timeout)
+			}
 			return
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
-// compact drops the fields that only make a log line longer.
+// compact drops the fields that only make a log line longer. Numbers are
+// kept as written: member IDs do not fit a float64.
 func compact(raw string) string {
 	var fields map[string]any
-	if json.Unmarshal([]byte(raw), &fields) != nil {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	if dec.Decode(&fields) != nil {
 		return raw
 	}
 	for _, k := range []string{"ts", "level", "caller"} {
@@ -528,11 +589,12 @@ func (e *env) finalKeys() map[string]bool {
 	return nil
 }
 
-func (e *env) verify(puts map[string][]put, final map[string]bool, tApply, tHeal int64) {
+func (e *env) verify(puts map[string][]put, final map[string]bool, tApply, tHeal int64, expected string) {
 	e.t.Helper()
 	e.logf("## checks")
 	from := tApply + settle.Milliseconds()
 	sides := 0
+	winner := ""
 	for _, m := range members {
 		var total, ok, missing, during, inFlight int
 		for _, p := range puts[m] {
@@ -554,6 +616,7 @@ func (e *env) verify(puts map[string][]put, final map[string]bool, tApply, tHeal
 		}
 		if during > 0 {
 			sides++
+			winner = m
 		}
 		e.logf("writer-%s: %d puts, %d successful, %d successful puts missing after the heal, "+
 			"%d successful puts started in the first %s of the partition, %d started later in the partition",
@@ -569,6 +632,12 @@ func (e *env) verify(puts map[string][]put, final map[string]bool, tApply, tHeal
 		e.t.Errorf("no side accepted writes during the partition; the survivor should have")
 	}
 	e.logf("sides with successful puts during the partition: %d", sides)
+	if !cfg.baseline() {
+		e.logf("survivor: %q, expected: %q", winner, expected)
+		if expected != "" && sides == 1 && winner != expected {
+			e.t.Errorf("%s became the survivor, expected %s", winner, expected)
+		}
+	}
 }
 
 func (e *env) timeline(puts map[string][]put, statuses []status, tApply, tHeal int64) {
@@ -585,9 +654,16 @@ func (e *env) timeline(puts map[string][]put, statuses []status, tApply, tHeal i
 	}
 	add(tApply, "partition applied")
 	add(tHeal, "partition removed")
+	for _, ev := range e.events {
+		add(ev.at, ev.what)
+	}
 	for _, m := range members {
-		var lastOK, firstFail, firstOKAfter int64
+		var lastOK, firstFail, firstOKAfter, firstOKDuring int64
+		from := tApply + settle.Milliseconds()
 		for _, p := range puts[m] {
+			if p.ok && p.start >= from && p.start < tHeal && firstOKDuring == 0 {
+				firstOKDuring = p.end
+			}
 			if p.ok && p.start < tHeal && p.end > lastOK {
 				lastOK = p.end
 			}
@@ -601,6 +677,7 @@ func (e *env) timeline(puts map[string][]put, statuses []status, tApply, tHeal i
 		add(lastOK, "writer-"+m+": last successful put before the heal returns")
 		add(firstFail, "writer-"+m+": first failed put starts")
 		add(firstOKAfter, "writer-"+m+": first successful put after the heal returns")
+		add(firstOKDuring, "writer-"+m+": first successful put during the partition returns")
 		var lost, back int64
 		for _, s := range statuses {
 			if s.member != m {
@@ -647,4 +724,103 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// twokStatuses logs twok status from both sidecars.
+func (e *env) twokStatuses() {
+	e.t.Helper()
+	if cfg.baseline() {
+		return
+	}
+	for _, m := range members {
+		e.twokStatus(m)
+	}
+}
+
+// watchWhileSurvivorAway waits until the survivor's Pod is back and ready,
+// and logs the other member's twok role while it is away.
+func (e *env) watchWhileSurvivorAway(survivor string, tKill time.Time) {
+	e.t.Helper()
+	other := members[0]
+	if other == survivor {
+		other = members[1]
+	}
+	type podState struct {
+		Metadata struct {
+			UID               string  `json:"uid"`
+			DeletionTimestamp *string `json:"deletionTimestamp"`
+		} `json:"metadata"`
+		Status struct {
+			Conditions []struct {
+				Type   string `json:"type"`
+				Status string `json:"status"`
+			} `json:"conditions"`
+		} `json:"status"`
+	}
+	oldUID := ""
+	lastRole := ""
+	deadline := tKill.Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		var p podState
+		out, err := e.kubectl("get", "pod", survivor, "--output", "json")
+		if err == nil && json.Unmarshal([]byte(out), &p) == nil {
+			if oldUID == "" && p.Metadata.DeletionTimestamp != nil {
+				oldUID = p.Metadata.UID
+			}
+			ready := false
+			for _, c := range p.Status.Conditions {
+				ready = ready || (c.Type == "Ready" && c.Status == "True")
+			}
+			if oldUID != "" && p.Metadata.UID != oldUID && ready {
+				e.logf("%s is back and ready, %.1f s after the deletion", survivor, time.Since(tKill).Seconds())
+				e.mark(ms(time.Now()), survivor+": new Pod ready")
+				return
+			}
+		}
+		if role := e.role(other); role != lastRole {
+			e.logf("%+.1f s after the deletion: %s twok role %s", time.Since(tKill).Seconds(), other, role)
+			lastRole = role
+		}
+		time.Sleep(2 * time.Second)
+	}
+	e.t.Errorf("%s did not come back within 5m", survivor)
+}
+
+// role returns a member's twok role from its metrics.
+func (e *env) role(member string) string {
+	metrics, err := e.metrics(member)
+	if err != nil {
+		return "unknown (metrics unreachable)"
+	}
+	for _, l := range strings.Split(metrics, "\n") {
+		if strings.HasPrefix(l, "twok_role{") && strings.HasSuffix(l, " 1") {
+			return l
+		}
+	}
+	return "unknown"
+}
+
+// metrics reads a member's twok metrics from the probe. The probe image has
+// bash but no HTTP client, so it is a plain HTTP/1.0 request on /dev/tcp.
+func (e *env) metrics(member string) (string, error) {
+	script := `exec 3<>/dev/tcp/` + member + `.etcd/2390 && printf 'GET /metrics HTTP/1.0\r\nHost: x\r\n\r\n' >&3 && timeout 3 cat <&3`
+	out, err := e.exec("probe", "bash", "-c", script)
+	return strings.ReplaceAll(out, "\r", ""), err
+}
+
+// moveLeader hands the Raft leadership from one member to another.
+func (e *env) moveLeader(ids map[string]string, from, to string) {
+	e.t.Helper()
+	target := ""
+	for id, name := range ids {
+		if name == to {
+			target = id
+		}
+	}
+	out, err := e.etcdctl(from, "move-leader", target)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.logf("move-leader %s -> %s: %s", from, to, strings.TrimSpace(out))
+	time.Sleep(2 * time.Second)
 }
