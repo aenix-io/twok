@@ -24,6 +24,10 @@ import (
 // BinaryEnv names the environment variable with the etcd binary.
 const BinaryEnv = "TEST_ETCD_BINARY"
 
+// LogDirEnv names an optional directory that receives a copy of every
+// member's log when the test ends, for logs too long for the test output.
+const LogDirEnv = "TEST_ETCD_LOG_DIR"
+
 // stopTimeout bounds a graceful stop; etcd needs well under a second.
 const stopTimeout = 30 * time.Second
 
@@ -63,6 +67,7 @@ type Member struct {
 	mu      sync.Mutex
 	cmd     *exec.Cmd
 	args    []string
+	extra   []string
 	exited  chan struct{}
 	waitErr error
 	log     *os.File
@@ -100,6 +105,7 @@ func NewMember(t testing.TB, ca *CA, dir, name string) *Member {
 		if t.Failed() {
 			t.Logf("%s log:\n%s", m.Name, tail(m.Log(t), 60))
 		}
+		keepLog(t, m)
 	})
 	return m
 }
@@ -154,7 +160,7 @@ func (m *Member) Start(t testing.TB, extra ...string) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start %s: %v", m.Name, err)
 	}
-	m.cmd, m.args, m.exited, m.waitErr = cmd, args, make(chan struct{}), nil
+	m.cmd, m.args, m.extra, m.exited, m.waitErr = cmd, args, slices.Clone(extra), make(chan struct{}), nil
 	exited := m.exited
 	go func() {
 		err := cmd.Wait()
@@ -163,6 +169,15 @@ func (m *Member) Start(t testing.TB, extra ...string) {
 		m.mu.Unlock()
 		close(exited)
 	}()
+}
+
+// ExtraArgs returns the arguments of the last start that came after
+// BaseArgs. A test that wants to restart a member "with its original flags"
+// saves them after the first start.
+func (m *Member) ExtraArgs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.extra)
 }
 
 // Args returns the arguments of the last start, without the binary.
@@ -371,6 +386,17 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+func keepLog(t testing.TB, m *Member) {
+	dir := os.Getenv(LogDirEnv)
+	if dir == "" {
+		return
+	}
+	name := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) + "_" + m.Name + ".log"
+	if err := copyFile(m.LogFile, filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Logf("keep the log of %s: %v", m.Name, err)
+	}
 }
 
 func isClosed(c chan struct{}) bool {
