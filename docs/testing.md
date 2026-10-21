@@ -96,6 +96,7 @@ For twok it means that the time to restore the pair after a heal depends on the 
 etcd creates its directories with mode 0700 as UID 65532.
 The NFS CSI driver deletes a volume's directory as a different user, fails with `permission denied`, and leaves the PersistentVolume `Released`.
 The first runs of the bench left six such volumes behind.
+They were reclaimed by hand: each PersistentVolume was bound to a new claim in the test namespace through `spec.claimRef` and `volumeName`, emptied from a Pod running as UID 65532, and released again, after which the driver deleted it.
 The harness and `hack/kubernetes-bench-clean.sh` now empty each volume from a Pod running as UID 65532 before deleting its claim, and the later runs left nothing.
 
 ## twok results
