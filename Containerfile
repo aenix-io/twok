@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+
+ARG GO_IMAGE=docker.io/library/golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af
+ARG BASE_IMAGE=gcr.io/distroless/static-debian12@sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2
+
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+WORKDIR /src
+# go.sum appears with the first dependency; until then only go.mod exists.
+COPY go.mod go.sum* ./
+RUN go mod download
+COPY cmd cmd
+COPY internal internal
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
+      -ldflags "-s -w -X github.com/aenix-io/twok/internal/version.Version=${VERSION}" \
+      -o /out/twok ./cmd/twok
+
+# The image holds twok alone. twok runs next to etcd, as a sidecar container
+# or a static Pod, and learns etcd's configuration from its command line.
+FROM ${BASE_IMAGE}
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="twok" \
+      org.opencontainers.image.description="twok arbiter agent, run next to etcd to break the tie between two members" \
+      org.opencontainers.image.source="https://github.com/aenix-io/twok" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}"
+COPY --from=build /out/twok /usr/local/bin/twok
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/twok"]

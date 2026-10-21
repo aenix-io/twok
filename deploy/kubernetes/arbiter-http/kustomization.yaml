@@ -1,0 +1,22 @@
+# twok with the reference HTTP arbiter, `twok arbiter serve`, as a Deployment
+# in the same namespace.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+  - arbiter.yaml
+patches:
+  - path: members.yaml
+# The arbiter runs the same twok image as the members' sidecar, taken from
+# the StatefulSet so that the image is still set in one place, the base.
+replacements:
+  - source:
+      kind: StatefulSet
+      name: etcd
+      fieldPath: spec.template.spec.initContainers.[name=twok].image
+    targets:
+      - select:
+          kind: Deployment
+          name: arbiter
+        fieldPaths:
+          - spec.template.spec.containers.[name=arbiter].image

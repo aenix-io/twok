@@ -1,0 +1,16 @@
+# twok with a ConfigMap in the Kubernetes API server as the arbiter. The
+# ConfigMap twok-arbiter is created by twok on the first claim; the members
+# only get get, create and update on it.
+#
+# This overlay puts the arbiter record in the cluster that runs the members,
+# which is fine for testing and wrong for two sites: the API server of that
+# cluster has to be reachable from both sites, and so it is a third site. For
+# a real deployment point TWOK_ARBITER at an API server elsewhere and mount
+# its credentials.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+  - rbac.yaml
+patches:
+  - path: arbiter.yaml

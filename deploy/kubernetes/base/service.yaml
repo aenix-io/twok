@@ -1,0 +1,41 @@
+# The headless Service gives every member a stable DNS name, etcd-<n>.etcd,
+# used for the peer and client URLs. Not-ready addresses are published because
+# a member without a leader is not ready, and the peers still have to find
+# each other to elect one.
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  labels:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/part-of: twok
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/part-of: twok
+  ports:
+    - name: client
+      port: 2379
+      targetPort: client
+    - name: peer
+      port: 2380
+      targetPort: peer
+---
+# The client Service routes to ready members only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd-client
+  labels:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/part-of: twok
+spec:
+  selector:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/part-of: twok
+  ports:
+    - name: client
+      port: 2379
+      targetPort: client

@@ -1,0 +1,171 @@
+# Two etcd members, each with the twok agent as a native sidecar.
+#
+# The Pod mirrors the member Pods of etcd-operator, so that the same agent
+# works when deploy/twok-agent.yaml injects it into operator Pods: the label
+# etcd-operator.cozystack.io/cluster, the container named etcd, the data
+# volume named data at /var/lib/etcd (and tls-client, tls-peer once TLS is
+# on). The operator itself does not act on these Pods; it works from its own
+# EtcdCluster and EtcdMember objects.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd
+  labels:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/part-of: twok
+spec:
+  serviceName: etcd
+  replicas: 2
+  # Both members must start together: the first one waits for the second to
+  # form the initial two-voter cluster.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: etcd
+      app.kubernetes.io/part-of: twok
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: etcd
+        app.kubernetes.io/part-of: twok
+        etcd-operator.cozystack.io/cluster: etcd
+    spec:
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      # twok finds etcd's process and stops it for a takeover or a rejoin;
+      # the kubelet then starts the etcd container again with its command,
+      # and twok has changed what it finds on the data volume.
+      shareProcessNamespace: true
+      terminationGracePeriodSeconds: 30
+      # The same unprivileged user in both containers: twok may signal etcd
+      # without any capability because it is the same user.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: etcd
+                  app.kubernetes.io/part-of: twok
+      initContainers:
+        # A native sidecar: it starts before etcd and runs next to it.
+        - name: twok
+          # Resolved by the images entry in kustomization.yaml.
+          image: twok
+          restartPolicy: Always
+          command:
+            - twok
+          # The agent's flags are set here and nowhere else in the
+          # StatefulSet. The other settings are files in the ConfigMap
+          # etcd-twok, mounted at /etc/twok.
+          args:
+            - agent
+            - --arbiter=$(TWOK_ARBITER)
+            - --endpoint=http://127.0.0.1:2379
+            - --data-dir=/var/lib/etcd
+            - --config-dir=/etc/twok
+            - --metrics-listen=:2390
+          env:
+            # Set by the arbiter overlay. An env entry rather than a
+            # ConfigMap key so that it can refer to $(NAMESPACE).
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TWOK_ARBITER
+              value: set-by-an-arbiter-overlay
+          ports:
+            - name: twok-metrics
+              containerPort: 2390
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/etcd
+            - name: twok-config
+              mountPath: /etc/twok
+              readOnly: true
+      containers:
+        - name: etcd
+          # Upstream etcd, resolved by the images entry in kustomization.yaml.
+          image: etcd
+          command:
+            - etcd
+          args:
+            - --name=$(POD_NAME)
+            - --data-dir=/var/lib/etcd
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://$(POD_NAME).etcd:2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --initial-advertise-peer-urls=http://$(POD_NAME).etcd:2380
+            - --listen-metrics-urls=http://0.0.0.0:2381
+            - --initial-cluster=etcd-0=http://etcd-0.etcd:2380,etcd-1=http://etcd-1.etcd:2380
+            - --initial-cluster-state=new
+            - --initial-cluster-token=$(NAMESPACE)-etcd
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: client
+              containerPort: 2379
+            - name: peer
+              containerPort: 2380
+            - name: etcd-metrics
+              containerPort: 2381
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: etcd-metrics
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/etcd
+      volumes:
+        - name: twok-config
+          configMap:
+            name: etcd-twok
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

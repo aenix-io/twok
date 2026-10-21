@@ -1,0 +1,65 @@
+name: Development image
+
+# Builds ghcr.io/aenix-io/twok from main for the test bench: the tag main
+# moves with every push, sha-<short sha> stays. Not signed and not a release.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-dev
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: ref
+        name: Image tags
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          {
+            echo "tags<<EOF"
+            echo "${image}:main"
+            echo "${image}:sha-${GITHUB_SHA::7}"
+            echo "EOF"
+            echo "version=main-${GITHUB_SHA::7}"
+          } >> "${GITHUB_OUTPUT}"
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          build-args: |
+            VERSION=${{ steps.ref.outputs.version }}
+          tags: ${{ steps.ref.outputs.tags }}
+          push: true
+      - name: Summary
+        env:
+          TAGS: ${{ steps.ref.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "Pushed, digest \`${DIGEST}\`:"
+            echo
+            while read -r tag; do
+              echo "- \`${tag}\`"
+            done <<< "${TAGS}"
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -1,0 +1,9 @@
+# twok with a single-member etcd cluster, run by etcd-operator, as the arbiter.
+# Requires etcd-operator (etcd-operator.cozystack.io/v1alpha2) in the cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+  - etcdcluster.yaml
+patches:
+  - path: arbiter.yaml

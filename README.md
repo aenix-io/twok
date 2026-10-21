@@ -11,9 +11,9 @@ A third member in a third site fixes that, but it takes part in every write, so 
 
 ## What twok does
 
-twok runs the etcd process on each of the two members. While the cluster has a leader, twok does nothing.
+twok is a small daemon next to each of the two etcd members, a sidecar on Kubernetes, a static Pod on Talos. While the cluster has a leader, twok does nothing.
 When the cluster has had no leader for a while, each member tries to claim the right to go on alone in an **arbiter**: a small record in an external system that supports an atomic compare-and-swap.
-Exactly one member can win. The winner restarts its etcd as a cluster of one and serves. The loser cannot commit anything, because Raft does not let a voter commit without the other, and when it meets the survivor again it discards its data and rejoins as a learner.
+Exactly one member can win. The winner stops its etcd, writes a cluster of one into its own log, and lets etcd start again as it always does; from then on it serves. The loser cannot commit anything, because Raft does not let a voter commit without the other, and when it meets the survivor again it is re-added as a learner and catches up from where it was.
 
 The arbiter is not on the write path, holds a few hundred bytes, and only matters when the cluster has lost its leader. It can be:
 
@@ -42,7 +42,7 @@ sequenceDiagram
     Note over A,B: the link heals
     B->>A: add me as a learner
     A-->>B: ok
-    Note over B: rebuilds from A, promoted to voter
+    Note over B: catches up from A, promoted to voter
 ```
 
 ## What is guaranteed, and what is not
@@ -62,15 +62,11 @@ The full table, with what was measured and what is only assumed, is in [docs/des
 
 ## How it runs
 
-twok is one binary that starts etcd as a child process and restarts it when it has to:
+twok runs next to etcd and leaves etcd's image and command line alone. It needs the member's client API, the member's data directory, and a way to stop the etcd process; whoever runs etcd starts it again.
 
-```bash
-twok run --arbiter s3://bucket/clusters/prod -- etcd --name a --data-dir /var/lib/etcd ...
-```
-
-- **Kubernetes:** a StatefulSet of two Pods, see [deploy/kubernetes/](deploy/kubernetes/).
-- **etcd-operator:** not without changes to the operator, see [docs/etcd-operator.md](docs/etcd-operator.md).
-- **Talos:** not supported; Talos runs etcd itself.
+- **Kubernetes with etcd-operator:** a sidecar injected by a MutatingAdmissionPolicy, as threek does, see [deploy/](deploy/).
+- **Kubernetes, hand-written:** the same sidecar in a StatefulSet, see [deploy/kubernetes/](deploy/kubernetes/).
+- **Talos:** a static Pod on every control-plane node; designed from the Talos code, not tested yet.
 
 ## Development
 

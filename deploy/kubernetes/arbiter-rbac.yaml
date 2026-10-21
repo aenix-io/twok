@@ -1,0 +1,58 @@
+# RBAC for the kubernetes:// arbiter backend.
+#
+# Apply this in the cluster that holds the arbiter ConfigMap, which must not
+# be the cluster whose etcd twok runs: that API server stops together with
+# the etcd it would arbitrate for. With --arbiter kubernetes://twok-arbiter/prod
+# twok reads and writes the ConfigMaps "prod" and "prod.probe" in the
+# namespace "twok-arbiter".
+#
+# twok members outside this cluster authenticate with a token of the
+# ServiceAccount below, given through TWOK_KUBERNETES_SERVER,
+# TWOK_KUBERNETES_TOKEN_FILE and TWOK_KUBERNETES_CA_FILE. The token can come
+# from `kubectl create token twok --namespace twok-arbiter`, which expires,
+# or from a Secret of type kubernetes.io/service-account-token, which does
+# not; the backend rereads the file on every request, so either can be
+# rotated in place.
+#
+# RBAC cannot restrict create by resource name, so create is granted on all
+# ConfigMaps of the namespace; keep the namespace dedicated to the arbiter.
+# get and update are limited to the record and its probe; adjust
+# resourceNames to the name in the arbiter URL.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: twok-arbiter
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: twok
+  namespace: twok-arbiter
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: twok-arbiter
+  namespace: twok-arbiter
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [prod, prod.probe]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: twok-arbiter
+  namespace: twok-arbiter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: twok-arbiter
+subjects:
+  - kind: ServiceAccount
+    name: twok
+    namespace: twok-arbiter

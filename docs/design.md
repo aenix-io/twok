@@ -15,11 +15,24 @@ twok keeps upstream etcd as it is and adds the one thing that is missing: a way 
 
 ## What twok does
 
-twok is a supervisor that runs the etcd process on each of the two members. It watches its own member and does nothing as long as the cluster has a leader. When the cluster has had no leader for a configured time, the supervisor tries to claim the right to continue alone in an **arbiter**: a record in an external system that supports an atomic compare-and-swap. Exactly one member can win the claim. The winner restarts its etcd as a cluster of one and serves. The loser cannot commit anything, by Raft itself, and when it meets the survivor again it discards its data and rejoins as a learner.
+twok is a small daemon that runs next to each of the two etcd members: a sidecar container in the member's Pod on Kubernetes, a static Pod on Talos.
+It talks to its member through the client API, and it can stop the etcd process and edit the member's data directory while etcd is down.
+It does nothing as long as the cluster has a leader.
 
-The arbiter is involved only when the cluster has lost its leader. It is not on the write path, it stores a few hundred bytes, and it needs no low latency. It can be an S3 bucket, another etcd cluster, a Kubernetes API server, or any HTTP service that implements the contract in [Arbiter backends](#arbiter-backends).
+When the cluster has had no leader for a configured time, the daemon tries to claim the right to continue alone in an **arbiter**: a record in an external system that supports an atomic compare-and-swap.
+Exactly one member can win the claim.
+The winner stops its etcd, rewrites the membership in its own log to a cluster of one, and lets etcd start again with the same flags as before; from then on it serves.
+The loser cannot commit anything, by Raft itself, and when it meets the survivor again it is re-added as a learner and catches up.
 
-This is the mechanism Red Hat ships in two-node OpenShift with fencing, with one difference. Red Hat fences the other node through its BMC before the survivor reconfigures etcd, and that fencing both breaks the tie and stops the other node. twok breaks the tie with the arbiter and relies on Raft to stop the other node's etcd, which it does by construction: a voter without a quorum commits nothing. twok fences etcd, not the node. Workloads and storage on the losing node are out of scope; see [What is not covered](#what-is-not-covered).
+The arbiter is involved only when the cluster has lost its leader.
+It is not on the write path, it stores a few hundred bytes, and it needs no low latency.
+It can be an S3 bucket, another etcd cluster, a Kubernetes API server, or any HTTP service that implements the contract in [Arbiter backends](#arbiter-backends).
+
+This is the mechanism Red Hat ships in two-node OpenShift with fencing, with two differences.
+Red Hat fences the other node through its BMC before the survivor reconfigures etcd; twok breaks the tie with the arbiter and relies on Raft to stop the other member's etcd, which it does by construction: a voter without a quorum commits nothing.
+And Red Hat's survivor restarts etcd with `--force-new-cluster`, which needs control over etcd's command line; twok writes the same membership change into the member's log itself, so etcd is restarted by whoever runs it, with the flags it always had.
+twok fences etcd, not the node.
+Workloads and storage on the losing node are out of scope; see the [Failure model](#failure-model).
 
 ## The model
 
@@ -41,20 +54,13 @@ The arbiter holds one record per cluster:
 }
 ```
 
-Every member keeps a small state file on the same volume as its etcd data directory:
-
-```json
-{"generation": 3, "role": "member"}
-```
-
-- `role: member` means the data directory is a legitimate copy of the cluster at this generation: the member was a voter at this generation, or became one by rejoining.
-- `role: joining` means the data directory was discarded and the member is being rebuilt from the survivor.
-
-A member with no state file is at generation 0.
+The cluster itself holds the generation too, as the key `/twok/generation`, written by the survivor right after it starts serving alone.
+That key is the member's proof of which generation its data belongs to: it reaches a member only through the Raft log, together with the membership changes of the same takeover, so a member whose copy of the key is behind the arbiter's generation holds data that is behind too.
+twok keeps no state file of its own; everything it needs to know about a member is in the member's data directory and in the arbiter.
 
 ### The rule
 
-> A member may become the survivor of generation g+1 only if it is a voter with a legitimate copy of generation g, and it wins the compare-and-swap from g to g+1 in the arbiter.
+> A member may become the survivor of generation g+1 only if it is a voter whose data holds generation g, and it wins the compare-and-swap from g to g+1 in the arbiter.
 
 The compare-and-swap is the whole tie-break. Two members that race for the same generation cannot both win. A member whose data belongs to an older generation than the arbiter's does not even try: its data is stale by definition, because a newer generation exists only when another member went on alone.
 
@@ -68,38 +74,39 @@ stateDiagram-v2
     Isolated --> Solo: CAS g→g+1 won
     Isolated --> Stale: arbiter generation > local generation
     Solo --> Pair: peer promoted to voter
-    Pair --> Stale: arbiter generation > local generation, or etcd exits as a removed member
-    Stale --> Joining: data set aside, added as a learner to the survivor
+    Pair --> Stale: arbiter generation > local generation
+    Stale --> Joining: survivor reachable, re-added as a learner
     Joining --> Pair: promoted to voter
 ```
 
-**Pair.** etcd runs with two voters and has a leader. twok polls the local member's `Status` every `poll-interval` and remembers who the leader is. Nothing else happens; the arbiter is not contacted.
+**Pair.** etcd runs with two voters and has a leader. twok polls the local member's `Status` every `poll-interval` and remembers who the leader is and what the member list is. Nothing else happens; the arbiter is not contacted.
 
 **Isolated.** The local member has reported no leader for `claim-after`. The leader of a two-voter cluster steps down as soon as it loses its follower (CheckQuorum), so both members see no leader within an election timeout, whatever the cause: a dead peer, a dead link, or a dead site. twok reads the arbiter:
 
 - If the arbiter's generation is higher than the local one, this member is stale and goes to **Stale**.
-- If the generations are equal, this member is a candidate. It waits `claim-delay`, plus `follower-extra-delay` if it was not the last leader it saw, then attempts the compare-and-swap from g to g+1 with itself as survivor. The delays give the last leader the first chance: its commit index is authoritative, the follower's may lag by a heartbeat.
+- If the generations are equal, this member is a candidate. It waits `claim-delay`, plus `follower-extra-delay` if it was not the last leader it saw, then attempts the compare-and-swap from g to g+1 with itself as survivor. The delays give the last leader the first chance.
 - If the arbiter cannot be reached, nothing happens, and the member stays isolated. etcd stays up and refuses writes on its own.
 - If a leader comes back at any point, the member returns to **Pair**.
 
-**Solo.** The member won. It writes `{"generation": g+1, "role": "member"}` to its state file, stops etcd, marks every entry in its own log as committed (see [The follower's last entries](#the-followers-last-entries)), starts etcd once with `--force-new-cluster`, waits for it to lead a cluster of one, and restarts it without the flag. From then on it serves. twok does not renew anything in the arbiter: a cluster of one keeps its quorum until a second voter is added, and only twok adds one.
+**Solo.** The member won. twok stops etcd, appends to the member's log the configuration changes that remove every other member, with the commit index at the end of the log (see [The whole log counts](#the-whole-log-counts)), and lets etcd start again with its usual flags. etcd replays the log, applies the changes, and leads a cluster of one within a couple of seconds. twok then writes `/twok/generation` with the new generation. It does not renew anything in the arbiter: a cluster of one keeps its quorum until a second voter is added, and only twok adds one.
 
-**Stale.** The member lost. Its etcd is stopped, if it had not already exited: a removed member that reaches the survivor's peer port is told it was removed and exits by itself. twok sets the data directory aside (the `member` directory is renamed, and only the latest copy is kept), writes `{"generation": <arbiter's>, "role": "joining"}`, and goes to **Joining**.
+**Stale.** The member lost. Its etcd keeps running: it cannot commit, and it serves serializable reads from data that is now behind. When it reaches the survivor's peer port it is told it was removed (HTTP 410 on the peer stream) and exits, with exit code 0 and no marker on disk; whoever runs etcd restarts it, and it exits again. twok does not parse that. It waits until the survivor's client API answers and goes to **Joining**.
 
-**Joining.** twok waits until the survivor's client API answers, asks it to add the local member as a learner, and starts etcd with `--initial-cluster-state=existing` and an initial cluster of the two members. When the learner has caught up, twok asks the survivor to promote it. When the local member reports that it is a voter, twok writes `{"generation": g, "role": "member"}` and is back in **Pair**.
+**Joining.** twok asks the survivor to add the local member as a learner, under a new member ID, with the local peer URLs. It then stops the local etcd, rewrites the member's log so that it belongs to the new ID, and lets etcd start again with its usual flags. The member keeps its data: it reconnects to the survivor, receives the entries it missed, applies the removal of its old ID and its own addition as a learner, and catches up from where it was. When the learner is caught up, the survivor's twok promotes it. When the local member reports that it is a voter, it is back in **Pair**.
 
-The survivor's twok takes no part in the rejoin beyond answering the API calls: the joining member drives its own return. The survivor returns to **Pair** when its member list shows two voters again.
+This rejoin, keeping the log and changing only the member's identity, is the one part of the design that rests on an experiment rather than on etcd's documented behaviour; see [Open questions](#open-questions). If it does not hold, the fallback is the rejoin Red Hat does, which discards the data directory and needs the member restarted with a different initial cluster, and so needs whoever runs etcd to cooperate.
+
+The survivor's twok takes no part in the rejoin beyond answering the API calls and promoting the learner. It returns to **Pair** when its member list shows two voters again.
 
 ### Startup
 
-twok starts etcd without consulting the arbiter when the state file says `member`:
+twok never blocks etcd's start: etcd is started by whoever runs it, before twok has looked at anything.
+That is safe:
 
-- If the data directory holds two voters, etcd cannot commit without the peer. If the peer became the survivor in the meantime, this member finds out from the arbiter during the next isolation, or from the survivor itself, which rejects it as removed.
-- If the data directory holds one voter, this member is the survivor of its generation, and no other member can have claimed a newer generation. A newer claim requires a voter at this generation, which means a member promoted into this cluster of one, and that promotion is in this member's log.
+- A member whose data holds two voters cannot commit without the peer. If the peer became the survivor in the meantime, this member finds out from the arbiter at the next isolation, or from the survivor itself, which rejects it as removed.
+- A member whose data holds one voter is the survivor of its generation, and no other member can have claimed a newer generation. A newer claim requires a voter at this generation, which means a member promoted into this cluster of one, and that promotion is in this member's log.
 
-Blocking the start on the arbiter would cost availability in exactly the case where the arbiter is not needed. twok still reads the arbiter at start when it can, logs the result, and acts on it if it shows the member is stale.
-
-When the state file says `joining`, twok resumes the join: it removes a half-added learner with the local peer URL if one is listed, and continues from **Stale**.
+twok reads the arbiter at start when it can, logs the result, and acts on it: a stale member is taken through **Stale** and **Joining**, a survivor whose takeover was interrupted after the claim finishes it.
 
 ## Safety argument
 
@@ -107,21 +114,21 @@ The property to prove: at any time, at most one etcd cluster derived from the or
 
 1. **At most one survivor per generation.** The arbiter's compare-and-swap from g to g+1 succeeds for at most one writer. Every backend provides this through a single primitive: a conditional write on a version token. A backend that cannot do that is not an arbiter; see [Arbiter backends](#arbiter-backends).
 
-2. **A loser never commits.** Until a member runs `--force-new-cluster`, its membership has two voters, and Raft commits nothing without both. Linearizable reads go through the same quorum check and fail as well. Serializable reads are served from the local copy and may be stale, which is their documented contract. This holds whether or not the loser knows it lost, and whether or not it can reach the arbiter.
+2. **A loser never commits.** Until a member's log says otherwise, its membership has two voters, and Raft commits nothing without both. Linearizable reads go through the same quorum check and fail as well. Serializable reads are served from the local copy and may be stale, which is their documented contract. This holds whether or not the loser knows it lost, and whether or not it can reach the arbiter.
 
-3. **A stale member never becomes a survivor.** The claim requires the member's generation to equal the arbiter's. A member at generation g cannot claim g+2. It can only rejoin g+1 as a learner, and it becomes a candidate for g+2 only after it is promoted, at which point its log contains everything committed at g+1 up to the promotion, and everything after the promotion needs its acknowledgement.
+3. **A stale member never becomes a survivor.** The claim requires the member's generation to equal the arbiter's. A member whose data holds generation g cannot claim g+2. It can only rejoin g+1 as a learner, and it becomes a candidate for g+2 only after it is promoted, at which point its log contains everything committed at g+1 up to the promotion, and everything after the promotion needs its acknowledgement.
 
 4. **A learner never becomes a survivor.** The claim requires `IsLearner == false` from the local member. A learner's log may lag arbitrarily, because the cluster of one commits without it.
 
 5. **Two members never run as clusters of one at the same time.** By 1 and 3: a second survivor needs a newer generation, which needs a voter at the current one, which needs a promotion into the current survivor's cluster, after which the current survivor has two voters again and cannot commit alone.
 
-6. **Acknowledged writes survive.** A write acknowledged at generation g was committed by the leader, so both voters hold it in their logs. The survivor is one of the two voters, so its log holds it. `--force-new-cluster` keeps every entry up to the member's own commit index; the paragraph below covers the entries after it.
+6. **Acknowledged writes survive.** A write acknowledged at generation g was committed by the leader, so both voters hold it in their logs. The survivor is one of the two voters, so its log holds it. twok appends to that log and truncates nothing, see below.
 
-### The follower's last entries
+### The whole log counts
 
-A follower acknowledges an entry to the leader as soon as it is in its log. The leader commits it, answers the client, and tells the follower about the new commit index in its next message, typically within one heartbeat interval (100 ms by default). If the partition hits in between, the follower holds an acknowledged entry that it does not know is committed. etcd's `--force-new-cluster` discards entries after the member's commit index, so a follower that becomes the survivor would lose it.
+A follower acknowledges an entry to the leader as soon as it is in its log. The leader commits it, answers the client, and tells the follower about the new commit index in its next message to it. If the partition hits in between, the follower holds an acknowledged entry that it does not know is committed, and it never learns. etcd's `--force-new-cluster` discards entries after the member's commit index, so a follower that becomes the survivor that way would lose it. Two details make the window wider than a heartbeat: the leader's notification is one message, lost with the partition, and the commit index alone is written to the WAL without a sync, so even a notification that arrived may not be on disk when the follower is killed. The fix in etcd 3.5.22 and 3.6.1, which keeps entries up to the applied index, does not cover this case: a follower cannot apply what it does not know is committed. The sources are in the research notes under [docs/research/](research/).
 
-twok closes this window. Before it runs `--force-new-cluster`, it rewrites the hard state in the member's WAL so that the commit index equals the last index of the log. This is safe in a two-voter cluster and only there:
+twok does not use `--force-new-cluster`. It writes the same configuration changes into the log itself, after the last entry, and sets the commit index at the end. Nothing is truncated. This is safe in a two-voter cluster and only there:
 
 - Every committed entry is in both logs, because a commit needs both acknowledgements.
 - No entry in either log was ever contradicted by a committed entry at the same index, because contradicting it would have required that member's acknowledgement, and the acknowledgement overwrites the entry.
@@ -129,7 +136,7 @@ twok closes this window. Before it runs `--force-new-cluster`, it rewrites the h
 
 The last leader is still preferred as the survivor through `follower-extra-delay`, so that in the common case no such entries exist at all.
 
-This step is the one place where twok touches etcd's files. It uses etcd's own WAL package and nothing else, and it is covered by a test that produces exactly this situation and checks that the acknowledged write survives.
+This is the one place where twok touches etcd's files. It uses etcd's own WAL package and nothing else, and a test produces exactly this situation and checks that the acknowledged write survives.
 
 ## Failure model
 
@@ -186,21 +193,32 @@ Link A-B breaks at T, A was the leader, both reach the arbiter:
 
 The numbers are starting points. Red Hat waits minutes before fencing to ride out short outages; the right value depends on the links.
 
+## etcd versions
+
+twok talks to etcd through the client API and touches the data directory only with etcd's own WAL package, whose format is the same in 3.5 and 3.6. The tests run against the newest 3.5 and the newest 3.6.
+
+Two etcd bugs matter for the takeover and the rejoin, and both are avoided or fixed in newer patch releases:
+
+- Before 3.5.20 a learner's promotion was stored only in the v2 store, and the member becomes a learner again on an upgrade to 3.6. Run 3.5.20 or later.
+- Before 3.5.25 `--force-new-cluster` does not remove a learner that is already in a snapshot, and the removal of the other member may not reach the backend when the applied index is ahead of the commit index. twok writes the commit index at the last entry before the restart, which puts it ahead of the applied index and avoids the second case; the first case does not occur in twok's flows, where a learner exists only while the survivor is already alone.
+
 ## Configuration
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `name` | | the etcd member name, taken from the etcd arguments |
-| `data-dir` | | the etcd data directory, taken from the etcd arguments |
+| `endpoint` | `https://127.0.0.1:2379` | client URL of the local member |
+| `data-dir` | | the member's data directory, as mounted into twok's container |
 | `arbiter` | | the arbiter URL, see [Arbiter backends](#arbiter-backends) |
 | `poll-interval` | `1s` | how often the local member's status is read |
 | `claim-after` | `20s` | how long the cluster must be without a leader before a claim is considered |
 | `claim-delay` | `3s` | extra wait before the claim for the member that was the last leader |
 | `follower-extra-delay` | `5s` | extra wait on top of `claim-delay` for a member that was not the last leader |
-| `commit-tail` | `true` | mark the whole log as committed before `--force-new-cluster` |
+| `mode` | `off` | `off`: observe and log only. `dry-run`: decide and log, never act. `enforce`: act. |
 | `metrics-listen` | empty | address for Prometheus metrics |
 
-twok reads the etcd arguments it is given after `--`, takes the member name, the data directory, the client and peer URLs and the TLS files from them, and passes everything through to etcd. It changes only `--initial-cluster`, `--initial-cluster-state` and `--force-new-cluster`, and only during a takeover or a rejoin.
+The TLS files for the client API are flags as in threek: `--cert-file`, `--key-file`, `--trusted-ca-file`.
+The member's name, peer URLs and the rest of its configuration twok reads from the etcd process itself: it runs in the same PID namespace and reads etcd's command line from `/proc`.
+As in threek, the settings shared by the members can come from a mounted ConfigMap that is read again before every poll, so `mode` is switched without restarting anything.
 
 ## Arbiter backends
 
@@ -224,14 +242,14 @@ A backend lives in its own package, registers its URL scheme, and touches nothin
 | Scheme | Store | Version token | Conditional write |
 | --- | --- | --- | --- |
 | `s3://bucket/key` | S3-compatible object store | ETag | `PUT` with `If-Match`, `If-None-Match: *` to create |
-| `etcd://host:2379/key` | another etcd cluster | mod revision | transaction on `ModRevision` |
+| `etcd://host:2379,host2:2379/key`, `etcd+tls://...` | another etcd cluster | mod revision | transaction on `ModRevision` |
 | `kubernetes://namespace/name` | a ConfigMap in a Kubernetes API server | resourceVersion | update with the resourceVersion |
-| `http://host/path` | any HTTP service | ETag | `PUT` with `If-Match`, `If-None-Match: *` to create, `412` on mismatch |
+| `http://host/path`, `https://...` | any HTTP service, see [arbiter-http.md](arbiter-http.md) | ETag | `PUT` with `If-Match`, `If-None-Match: *` to create, `412` on mismatch |
 | `file:///path` | a local file, for tests | content hash | lock and rename |
 
 Not every S3-compatible store implements conditional writes, and some ignore the headers instead of rejecting them. twok verifies the conditional write on a probe key at startup and refuses to run against a store that does not honour it. The probe is a write next to the record, under the same prefix with a `.probe` suffix.
 
-The `http` contract is small enough for a Cloudflare Worker with a Durable Object, a few lines of any web framework, or `twok arbiter serve`, a reference implementation that keeps its records in a file. That server is a single point of failure for arbitration, not for writes, which is the trade-off the arbiter model makes everywhere.
+The `http` contract is small enough for a Cloudflare Worker with a Durable Object, a few lines of any web framework, or `twok arbiter serve`, a reference implementation that keeps its records in a directory. That server is a single point of failure for arbitration, not for writes, which is the trade-off the arbiter model makes everywhere.
 
 ## Manual intervention
 
@@ -241,17 +259,29 @@ An administrator who runs `--force-new-cluster` by hand must also claim the gene
 
 ## Deployment
 
-twok is one binary with the etcd binary next to it. The etcd process is a child of twok and is restarted by twok; etcd's image, version and arguments stay with whoever provides them.
+twok is one program, run next to the etcd process, with three things from the platform: the client API of the local member, the member's data directory, and the ability to stop the etcd process and have it started again with the same flags.
 
-- **Kubernetes:** a StatefulSet of two Pods, each running `twok run -- etcd ...` with an init container that copies the etcd binary from the upstream image. `deploy/kubernetes/` holds the manifests, with the arbiter URL in a ConfigMap and the credentials in a Secret.
-- **etcd-operator:** not supported without changes to the operator. The operator builds the member Pods itself, with the etcd image as the only container and no way to add one or change the command. What the operator would need is listed in [docs/etcd-operator.md](etcd-operator.md).
-- **Talos:** not supported. Talos runs etcd as a system service from its own image, outside Kubernetes, and twok cannot supervise it. A two-node Talos control plane with an arbiter needs the same mechanism inside Talos, which is a question for Talos.
+| Platform | Delivery | Stopping etcd | Restarting etcd | Status |
+| --- | --- | --- | --- | --- |
+| Kubernetes with etcd-operator | sidecar injected by a MutatingAdmissionPolicy, as threek does; the policy also mounts the `data` volume and sets `shareProcessNamespace` | `SIGTERM` to the etcd process, found through `/proc` | kubelet restarts the container with the same command | the policy is tested on kind in CI; the test bench runs the same Pod layout as a StatefulSet because the test cluster is on Kubernetes 1.33 |
+| Kubernetes, hand-written StatefulSet | the same sidecar in the Pod template | the same | the same | tested, see [testing.md](testing.md) |
+| Talos | static Pod on every control-plane node with host PID, as threek's but with `/var/lib/etcd` mounted | `SIGTERM` to the etcd process | Talos restarts the service | designed, not tested |
+
+What twok owes to the systems that run etcd:
+
+- it never changes etcd's image, binary or command line;
+- it stops etcd only during a takeover or a rejoin, and only after the arbiter decided;
+- it edits the data directory only while etcd is stopped, and only through etcd's own WAL package;
+- a crash, a leak or a missing image of twok never touches the etcd process; with the operator the sidecar counts toward the Pod's readiness as threek's does.
+
+The operator needs no change to run twok, beyond what threek already relies on. What it does not do well with a cluster whose membership twok changes is listed in [etcd-operator.md](etcd-operator.md).
 
 ## Security
 
 - twok listens on nothing but its optional metrics endpoint. It connects to the two members' client URLs and to the arbiter.
 - It authenticates to etcd with the member's own certificates, and to the arbiter with whatever the backend needs, read from files or the environment.
-- It writes the state file, renames the data directory on a rejoin, and rewrites the WAL hard state on a takeover. Nothing else on disk.
+- It sends `SIGTERM` to the etcd process, which runs as the same user, and rewrites the WAL of a stopped member. Nothing else on disk, and nothing else in the process table.
+- It writes `/twok/generation` in the cluster's own keyspace, which Kubernetes API servers never read.
 - The arbiter record contains member names, IDs and timestamps. No data, no keys.
 
 ## Observability
@@ -285,12 +315,15 @@ Every transition is logged with its reason and the generation.
 | A full third member in a third site | the question twok asks is how to avoid exactly that, because of latency and cost |
 | Node fencing through a BMC, as in Red Hat's two-node OpenShift | the right tool when the node's workloads and storage must be stopped too; for etcd alone, Raft already stops the loser, and most of our targets have no BMC the cluster may use |
 | A lease with a TTL instead of generations | a lease expires while the holder still serves, and the loser could take it over with stale data; the generation is monotonic and the loser's data says which generation it belongs to |
-| Re-adding the loser by copying a snapshot | the learner path is what etcd supports and what the operator will do; a snapshot copy would need twok to run etcdutl on both sides |
-| twok as a sidecar that only observes, as threek | a takeover needs a restart of etcd with different flags, which only the process's parent can do |
-| Keeping `--force-new-cluster` in the arguments after the takeover | an etcd restart while a learner is joining would remove the learner again |
+| A state file next to the data directory | the generation key in the cluster's own keyspace is tied to the log that carries the membership changes, so it cannot disagree with the data; a file can |
+| twok as etcd's parent process, delivered in an image that stands in for etcd | ties etcd's security fixes to twok's releases, restarts etcd on every settings change, and has to be the image everywhere; the daemon leaves etcd's image and command line alone, as threek does |
+| etcd embedded in twok as a library | every etcd flag would have to be parsed as etcd parses it, and etcd rebuilt for every release |
+| `--force-new-cluster` on the survivor | needs control over the command line, and it truncates the log after the commit index; the same configuration changes written into the log by twok need neither |
+| Re-adding the loser from a wiped data directory, as Red Hat does | needs a different initial cluster on the next start, which only the process's parent can provide; keeping the log and changing the member's identity needs nothing from the platform and copies only what the member missed |
+| A demotion of the loser to a learner instead of a removal | Raft would accept it, but etcd's membership layer has no demotion and would panic on the entry |
 
 ## Open questions
 
-1. Whether `claim-after` should scale with the election timeout, or stay a wall-clock setting as Red Hat's fencing delay is.
-2. Whether the survivor should wait for a quiet period before accepting a learner, to spread the catch-up load.
-3. What the operator needs to run two-member clusters natively; see [docs/etcd-operator.md](etcd-operator.md).
+1. Whether a member can rejoin by keeping its log under a new member ID, as described in **Joining**. The experiment and its result are in [testing.md](testing.md); until it is positive on both supported etcd versions, the rejoin is the open end of the design.
+2. Whether `claim-after` should scale with the election timeout, or stay a wall-clock setting as Red Hat's fencing delay is.
+3. How twok stops etcd on Talos without privileges beyond the etcd user, and whether Talos's own etcd health checks tolerate the restart.
