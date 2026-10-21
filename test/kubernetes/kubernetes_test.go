@@ -126,6 +126,10 @@ type env struct {
 	t      *testing.T
 	log    *bytes.Buffer // the raw record of the run, for TWOK_RESULTS
 	events []event       // extra timeline entries
+	// rejoinAt is when a member's agent added it as a learner of the
+	// survivor, from its log; from then on its writes go to the survivor's
+	// cluster.
+	rejoinAt map[string]int64
 }
 
 type event struct {
