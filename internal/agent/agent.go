@@ -416,6 +416,15 @@ func (a *Agent) report(d engine.Decision) {
 	attrs := []any{"role", d.Role, "note", d.Note, "generation", d.Generation, "mode", a.cfg.Mode}
 	if d.Role != a.role {
 		attrs = append(attrs, "from", a.role)
+		if d.Role == engine.RolePair {
+			// A member in a pair is a voter: a rejoin, if there was one,
+			// is done, and the WAL it kept to undo the edit is not needed
+			// any more. After a restart of twok the previous role is
+			// unknown, so this runs on every entry into pair.
+			if err := a.wal.Cleanup(a.dataDir); err != nil {
+				a.logger.Warn("removing the WAL kept by the rejoin failed", "error", err)
+			}
+		}
 		a.role = d.Role
 	}
 	if d.Action.Kind != engine.ActionNone {
@@ -571,6 +580,12 @@ func (a *Agent) rejoin(ctx context.Context, act engine.Action) *engine.Result {
 		a.logger.Info("rejoin: the survivor already has this member as a learner", "survivor", survivor.Endpoint(), "learner", engine.Hex(learner))
 	}
 	r.Learner = learner
+	// The log is rewritten only for a learner the survivor's member list
+	// shows with the local peer URLs: the answer to AddLearner alone could
+	// be lost, or come from a member that is no longer the survivor.
+	if err := a.confirmLearner(ctx, survivor, learner, act.PeerURLs); err != nil {
+		return fail(err)
+	}
 	err = a.withStopped(ctx, "rejoin", func() error { return a.wal.Reidentify(a.dataDir, learner) })
 	if err != nil {
 		return fail(err)
@@ -579,6 +594,21 @@ func (a *Agent) rejoin(ctx context.Context, act engine.Action) *engine.Result {
 	a.metrics.rejoins.WithLabelValues("success").Inc()
 	a.logger.Info("rejoin: etcd runs as the new learner", "learner", engine.Hex(learner))
 	return r
+}
+
+func (a *Agent) confirmLearner(ctx context.Context, survivor Client, learner uint64, peerURLs []string) error {
+	cctx, cancel := context.WithTimeout(ctx, a.pollTimeout)
+	defer cancel()
+	ms, err := survivor.Members(cctx)
+	if err != nil {
+		return fmt.Errorf("confirm learner %s on %s: %w", engine.Hex(learner), survivor.Endpoint(), err)
+	}
+	for _, l := range ms.Learners {
+		if l.ID == learner && sameURLs(l.PeerURLs, peerURLs) {
+			return nil
+		}
+	}
+	return fmt.Errorf("the survivor %s does not list learner %s with peer URLs %v", survivor.Endpoint(), engine.Hex(learner), peerURLs)
 }
 
 // findSurvivor returns a client for the first endpoint that answers as the

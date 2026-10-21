@@ -206,7 +206,7 @@ func TestRejoinReusesTheLearnerAndChecksTheSurvivor(t *testing.T) {
 	h2 := newHarness(t, fastConfig(config.ModeEnforce))
 	_, _ = h2.arb.CompareAndSwap(context.Background(), arbiter.Zero, arbiter.Record{ClusterID: "c1", Generation: 1, Survivor: "b", SurvivorMemberID: "b"})
 	h2.cutLink()
-	h2.peer.set(func(f *fakeMember) { f.members.Voters = append(f.members.Voters, member(0xa, "a")) })
+	h2.peer.set(func(f *fakeMember) { f.members.Voters = append(f.members.Voters, memberEntry(0xa, "a")) })
 	h2.ticks(20)
 	if len(h2.peer.added) != 0 || len(h2.wal.reids) != 0 || h2.proc.stops != 0 {
 		t.Fatalf("joined a survivor with two voters: added %v", h2.peer.added)
@@ -217,6 +217,20 @@ func TestRejoinReusesTheLearnerAndChecksTheSurvivor(t *testing.T) {
 	// Retried every RetryDelay, each attempt after a fresh arbiter read.
 	if h2.arb.reads < 4 || h2.arb.reads > 6 {
 		t.Errorf("arbiter read %d times in 20s of failed rejoins", h2.arb.reads)
+	}
+
+	// A learner the survivor does not list afterwards is not trusted: the
+	// log is not rewritten for it.
+	h4 := newHarness(t, fastConfig(config.ModeEnforce))
+	_, _ = h4.arb.CompareAndSwap(context.Background(), arbiter.Zero, arbiter.Record{ClusterID: "c1", Generation: 1, Survivor: "b", SurvivorMemberID: "b"})
+	h4.cutLink()
+	h4.peer.set(func(f *fakeMember) { f.forget = true })
+	h4.ticks(3)
+	if len(h4.peer.added) != 1 || len(h4.wal.reids) != 0 || h4.proc.stops != 0 {
+		t.Fatalf("added %v, reidentify %x, stops %d; want no edit for an unconfirmed learner", h4.peer.added, h4.wal.reids, h4.proc.stops)
+	}
+	if !strings.Contains(h4.logs.String(), "does not list learner 101") {
+		t.Errorf("the refusal is not logged:\n%s", h4.logs)
 	}
 
 	// A member at the endpoint that belongs to another cluster is not
@@ -235,7 +249,7 @@ func TestPromote(t *testing.T) {
 	h := newHarness(t, fastConfig(config.ModeEnforce))
 	h.local.set(func(f *fakeMember) {
 		f.gen = 1
-		f.members = engine.Members{Voters: []engine.Member{member(0xa, "a")}, Learners: []engine.Member{member(0x101, "b")}}
+		f.members = engine.Members{Voters: []engine.Member{memberEntry(0xa, "a")}, Learners: []engine.Member{memberEntry(0x101, "b")}}
 		f.promoteErr = ErrLearnerNotReady
 	})
 	h.ticks(10)

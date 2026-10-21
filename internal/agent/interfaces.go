@@ -60,6 +60,9 @@ type WAL interface {
 	Standalone(dataDir string, self uint64, remove []uint64) error
 	// Reidentify makes the log belong to member newID, keeping the data.
 	Reidentify(dataDir string, newID uint64) error
+	// Cleanup removes what Reidentify kept to undo the edit, once the
+	// member is a voter again.
+	Cleanup(dataDir string) error
 }
 
 // Process is the etcd process that uses the data directory.

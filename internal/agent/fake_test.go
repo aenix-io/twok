@@ -44,6 +44,9 @@ type fakeMember struct {
 	statusN    int
 	hang       chan struct{}
 	nextID     uint64
+	// forget makes AddLearner answer without the learner showing up in
+	// the member list.
+	forget bool
 }
 
 func (f *fakeMember) Endpoint() string { return f.endpoint }
@@ -105,7 +108,9 @@ func (f *fakeMember) AddLearner(_ context.Context, peerURLs []string) (engine.Me
 	f.added = append(f.added, peerURLs)
 	f.nextID++
 	m := engine.Member{ID: 0x100 + f.nextID, PeerURLs: peerURLs}
-	f.members.Learners = append(f.members.Learners, m)
+	if !f.forget {
+		f.members.Learners = append(f.members.Learners, m)
+	}
 	return m, nil
 }
 
@@ -143,6 +148,7 @@ type fakeWAL struct {
 	err         error
 	standalones []string
 	reids       []uint64
+	cleanups    int
 }
 
 func (w *fakeWAL) Standalone(dataDir string, self uint64, remove []uint64) error {
@@ -175,6 +181,13 @@ func (w *fakeWAL) Reidentify(_ string, newID uint64) error {
 	w.local.set(func(f *fakeMember) {
 		f.st.MemberID, f.st.IsLearner, f.st.Leader = newID, true, 0
 	})
+	return nil
+}
+
+func (w *fakeWAL) Cleanup(string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.cleanups++
 	return nil
 }
 
@@ -292,7 +305,7 @@ func fastConfig(mode config.Mode) config.Config {
 	return config.Config{Mode: mode, PollInterval: time.Second, ClaimAfter: 5 * time.Second, ClaimDelay: time.Second, FollowerExtraDelay: 2 * time.Second}
 }
 
-func member(id uint64, name string) engine.Member {
+func memberEntry(id uint64, name string) engine.Member {
 	return engine.Member{ID: id, Name: name, PeerURLs: []string{"https://" + name + ":2380"}, ClientURLs: []string{"https://" + name + ":2379"}}
 }
 
@@ -302,12 +315,12 @@ func newHarness(t *testing.T, cfg config.Config) *harness {
 	local := &fakeMember{
 		endpoint: "https://127.0.0.1:2379",
 		st:       engine.Status{ClusterID: clusterID, MemberID: 0xa, Leader: 0xa, CommitIndex: 100, AppliedIndex: 100},
-		members:  engine.Members{Voters: []engine.Member{member(0xa, "a"), member(0xb, "b")}},
+		members:  engine.Members{Voters: []engine.Member{memberEntry(0xa, "a"), memberEntry(0xb, "b")}},
 	}
 	peer := &fakeMember{
 		endpoint: "https://b:2379",
 		st:       engine.Status{ClusterID: clusterID, MemberID: 0xb, Leader: 0xb},
-		members:  engine.Members{Voters: []engine.Member{member(0xb, "b")}},
+		members:  engine.Members{Voters: []engine.Member{memberEntry(0xb, "b")}},
 		gen:      1,
 	}
 	h := &harness{
