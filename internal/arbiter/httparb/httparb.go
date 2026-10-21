@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/aenix-io/twok/internal/arbiter"
-	"github.com/aenix-io/twok/internal/arbiter/probe"
 	"github.com/aenix-io/twok/internal/arbiter/writeid"
 )
 
@@ -40,10 +39,6 @@ const (
 	// maxRecordSize bounds what Read accepts and what the server stores.
 	// A record is a few hundred bytes.
 	maxRecordSize = 64 << 10
-	// wrongETag is the version Verify swaps from. The reference server's
-	// ETags are quoted SHA-256 digests, and no content has the all-zero
-	// digest; any other service is equally unlikely to hand it out.
-	wrongETag = `"0000000000000000000000000000000000000000000000000000000000000000"`
 )
 
 func init() {
@@ -174,8 +169,8 @@ func (a *Arbiter) CompareAndSwap(ctx context.Context, expected arbiter.Version, 
 // Verify runs the probe on the record's URL with the probe suffix.
 func (a *Arbiter) Verify(ctx context.Context) error {
 	p := *a
-	p.url += probe.Suffix
-	return probe.Verify(ctx, &p, wrongETag)
+	p.url += arbiter.ProbeSuffix
+	return arbiter.VerifyProbe(ctx, &p)
 }
 
 // answer is a complete HTTP answer, read and closed.

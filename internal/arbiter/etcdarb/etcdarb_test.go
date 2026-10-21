@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"net/url"
@@ -24,6 +25,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/aenix-io/twok/internal/arbiter"
+	"github.com/aenix-io/twok/internal/arbiter/arbitertest"
 	"github.com/aenix-io/twok/internal/arbiter/castest"
 )
 
@@ -32,20 +34,26 @@ import (
 // only the server has them.
 const binaryEnv = "TEST_ETCD_BINARY"
 
-func TestArbiter(t *testing.T) {
-	addr := startEtcd(t, nil)
-	a := open(t, "etcd://"+addr+"/twok/test")
-	castest.Exercise(t, a)
+func TestConformance(t *testing.T) {
+	arbitertest.Run(t, fresh("etcd://"+startEtcd(t, nil)))
 }
 
-func TestArbiterTLS(t *testing.T) {
+func TestConformanceTLS(t *testing.T) {
 	pki := newPKI(t)
 	addr := startEtcd(t, pki)
 	t.Setenv(CAEnv, pki.ca)
 	t.Setenv(CertEnv, pki.clientCert)
 	t.Setenv(KeyEnv, pki.clientKey)
-	a := open(t, "etcd+tls://"+addr+"/twok/test")
-	castest.Exercise(t, a)
+	arbitertest.Run(t, fresh("etcd+tls://"+addr))
+}
+
+// fresh returns arbiters for keys no earlier call used, on one etcd.
+func fresh(base string) func(t *testing.T) arbiter.Arbiter {
+	n := 0
+	return func(t *testing.T) arbiter.Arbiter {
+		n++
+		return open(t, fmt.Sprintf("%s/twok/test-%d", base, n))
+	}
 }
 
 func TestTLSWithoutClientCertificateIsRefused(t *testing.T) {

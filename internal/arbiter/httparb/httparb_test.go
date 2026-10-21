@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/aenix-io/twok/internal/arbiter"
+	"github.com/aenix-io/twok/internal/arbiter/arbitertest"
 	"github.com/aenix-io/twok/internal/arbiter/castest"
 )
 
@@ -25,12 +26,26 @@ func open(t *testing.T, raw string) *Arbiter {
 	return a.(*Arbiter)
 }
 
-func TestArbiterAgainstReferenceServer(t *testing.T) {
+func TestConformance(t *testing.T) {
+	arbitertest.Run(t, func(t *testing.T) arbiter.Arbiter {
+		srv := httptest.NewServer(NewServer(t.TempDir()))
+		t.Cleanup(srv.Close)
+		return open(t, srv.URL+"/clusters/prod")
+	})
+}
+
+func TestStoredFiles(t *testing.T) {
 	dir := t.TempDir()
 	srv := httptest.NewServer(NewServer(dir))
 	t.Cleanup(srv.Close)
-	castest.Exercise(t, open(t, srv.URL+"/clusters/prod"))
-	for _, name := range []string{"prod", "prod.probe"} {
+	a := open(t, srv.URL+"/clusters/prod")
+	if _, err := a.CompareAndSwap(t.Context(), arbiter.Zero, castest.Record(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Verify(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"prod", "prod" + arbiter.ProbeSuffix} {
 		if _, err := os.Stat(filepath.Join(dir, "clusters", name)); err != nil {
 			t.Errorf("record file: %v", err)
 		}

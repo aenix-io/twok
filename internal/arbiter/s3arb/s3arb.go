@@ -66,7 +66,6 @@ import (
 	"github.com/aws/smithy-go"
 
 	"github.com/aenix-io/twok/internal/arbiter"
-	"github.com/aenix-io/twok/internal/arbiter/probe"
 	"github.com/aenix-io/twok/internal/arbiter/writeid"
 )
 
@@ -84,10 +83,6 @@ const (
 	// maxRecordSize bounds what Read accepts. A record is a few hundred
 	// bytes; anything much larger is not ours.
 	maxRecordSize = 1 << 20
-	// wrongETag is the version Verify swaps from. It is well-formed, and
-	// no object has it: an MD5 of all zeros has no known preimage, and a
-	// multipart ETag has a part count suffix.
-	wrongETag = `"00000000000000000000000000000000"`
 )
 
 func init() {
@@ -268,8 +263,8 @@ func (a *Arbiter) CompareAndSwap(ctx context.Context, expected arbiter.Version, 
 // Verify runs the probe on the key with the probe suffix.
 func (a *Arbiter) Verify(ctx context.Context) error {
 	p := *a
-	p.key += probe.Suffix
-	return probe.Verify(ctx, &p, wrongETag)
+	p.key += arbiter.ProbeSuffix
+	return arbiter.VerifyProbe(ctx, &p)
 }
 
 // isNotFound recognises a missing object. GetObject reports it as

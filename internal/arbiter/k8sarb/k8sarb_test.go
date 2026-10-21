@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/aenix-io/twok/internal/arbiter"
+	"github.com/aenix-io/twok/internal/arbiter/arbitertest"
 	"github.com/aenix-io/twok/internal/arbiter/castest"
 )
 
@@ -183,10 +184,36 @@ func open(t *testing.T) arbiter.Arbiter {
 	return a
 }
 
-func TestArbiter(t *testing.T) {
+// fresh returns arbiters for ConfigMaps no earlier call used, on the API
+// server the environment points at.
+func fresh() func(t *testing.T) arbiter.Arbiter {
+	n := 0
+	return func(t *testing.T) arbiter.Arbiter {
+		t.Helper()
+		n++
+		a, err := arbiter.Open(fmt.Sprintf("kubernetes://%s/twok-arbiter-%d", testNamespace, n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+}
+
+func TestConformance(t *testing.T) {
+	setup(t, newFakeAPI())
+	arbitertest.Run(t, fresh())
+}
+
+func TestStoredConfigMap(t *testing.T) {
 	f := newFakeAPI()
 	setup(t, f)
-	castest.Exercise(t, open(t))
+	a := open(t)
+	if _, err := a.CompareAndSwap(t.Context(), arbiter.Zero, castest.Record(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Verify(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	f.do(func() {
 		if _, ok := f.objects["twok-arbiter.probe"]; !ok {
 			t.Error("Verify did not leave the probe ConfigMap")
@@ -304,11 +331,10 @@ func TestInCluster(t *testing.T) {
 	t.Setenv(ServerEnv, "")
 	t.Setenv("KUBERNETES_SERVICE_HOST", u.Hostname())
 	t.Setenv("KUBERNETES_SERVICE_PORT", u.Port())
-	a := open(t)
-	if !strings.Contains(a.String(), u.Host) {
-		t.Fatalf("String() = %q, want the service address %s", a, u.Host)
+	if s := open(t).String(); !strings.Contains(s, u.Host) {
+		t.Fatalf("String() = %q, want the service address %s", s, u.Host)
 	}
-	castest.Exercise(t, a)
+	arbitertest.Run(t, fresh())
 }
 
 func TestConnectionSettings(t *testing.T) {

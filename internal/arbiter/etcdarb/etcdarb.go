@@ -50,7 +50,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/aenix-io/twok/internal/arbiter"
-	"github.com/aenix-io/twok/internal/arbiter/probe"
 )
 
 // The URL schemes this backend registers.
@@ -73,9 +72,6 @@ const (
 	// deadline or none. A claim that hangs delays the takeover more than one
 	// that fails and is retried.
 	timeout = 10 * time.Second
-	// wrongRevision is the version Verify swaps from. etcd revisions are
-	// int64 and grow by one per write, so no key reaches this one.
-	wrongRevision = "9223372036854775807"
 )
 
 func init() {
@@ -263,8 +259,8 @@ func (a *Arbiter) CompareAndSwap(ctx context.Context, expected arbiter.Version, 
 // Verify runs the probe on the key with the probe suffix.
 func (a *Arbiter) Verify(ctx context.Context) error {
 	p := *a
-	p.key += probe.Suffix
-	return probe.Verify(ctx, &p, wrongRevision)
+	p.key += arbiter.ProbeSuffix
+	return arbiter.VerifyProbe(ctx, &p)
 }
 
 func revisionVersion(rev int64) arbiter.Version {

@@ -67,7 +67,6 @@ import (
 	"time"
 
 	"github.com/aenix-io/twok/internal/arbiter"
-	"github.com/aenix-io/twok/internal/arbiter/probe"
 )
 
 // Scheme is the URL scheme this backend registers.
@@ -89,10 +88,6 @@ const (
 	maxResponseSize = 2 << 20
 	// recordKey is the key in data that holds the record.
 	recordKey = "record"
-	// wrongResourceVersion is the version Verify swaps from. The API
-	// server parses resourceVersion as a uint64 before it compares, and
-	// this is the largest one, which etcd's int64 revisions never reach.
-	wrongResourceVersion = "18446744073709551615"
 )
 
 // serviceAccountDir is where a Pod finds its service account token and
@@ -172,8 +167,8 @@ func parseURL(u *url.URL) (namespace, name string, err error) {
 		return "", "", fmt.Errorf("kubernetes arbiter: %q is not a namespace name (URL form %s)", namespace, form)
 	}
 	// The probe's name must be valid too, hence the room for the suffix.
-	if len(name)+len(probe.Suffix) > 253 || !dnsSubdomain.MatchString(name) {
-		return "", "", fmt.Errorf("kubernetes arbiter: %q is not a ConfigMap name of at most %d characters (URL form %s)", name, 253-len(probe.Suffix), form)
+	if len(name)+len(arbiter.ProbeSuffix) > 253 || !dnsSubdomain.MatchString(name) {
+		return "", "", fmt.Errorf("kubernetes arbiter: %q is not a ConfigMap name of at most %d characters (URL form %s)", name, 253-len(arbiter.ProbeSuffix), form)
 	}
 	return namespace, name, nil
 }
@@ -297,8 +292,8 @@ func (a *Arbiter) CompareAndSwap(ctx context.Context, expected arbiter.Version, 
 // Verify runs the probe on the ConfigMap with the probe suffix.
 func (a *Arbiter) Verify(ctx context.Context) error {
 	p := *a
-	p.name += probe.Suffix
-	return probe.Verify(ctx, &p, wrongResourceVersion)
+	p.name += arbiter.ProbeSuffix
+	return arbiter.VerifyProbe(ctx, &p)
 }
 
 func (a *Arbiter) collectionPath() string {

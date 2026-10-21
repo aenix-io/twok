@@ -3,6 +3,7 @@ package s3arb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 
 	"github.com/aenix-io/twok/internal/arbiter"
+	"github.com/aenix-io/twok/internal/arbiter/arbitertest"
 	"github.com/aenix-io/twok/internal/arbiter/castest"
 )
 
@@ -46,18 +48,31 @@ func newTestArbiter(t *testing.T, f *fakeS3) *Arbiter {
 	return newWithConfig(cfg, testBucket, testKey, true)
 }
 
-func TestArbiter(t *testing.T) {
+func TestConformance(t *testing.T) {
+	arbitertest.Run(t, func(t *testing.T) arbiter.Arbiter { return newTestArbiter(t, newFakeS3()) })
+}
+
+func TestStoredObject(t *testing.T) {
 	f := newFakeS3()
 	a := newTestArbiter(t, f)
-	castest.Exercise(t, a)
+	if _, err := a.CompareAndSwap(t.Context(), arbiter.Zero, castest.Record(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Verify(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	var ct string
+	var body []byte
 	var probed bool
 	f.do(func() {
-		ct = f.types[testBucket+"/"+testKey]
-		_, probed = f.objects[testBucket+"/"+testKey+".probe"]
+		ct, body = f.types[testBucket+"/"+testKey], f.objects[testBucket+"/"+testKey]
+		_, probed = f.objects[testBucket+"/"+testKey+arbiter.ProbeSuffix]
 	})
 	if ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if !strings.Contains(string(body), `"writeID":"`) {
+		t.Errorf("stored object %s has no write identifier", body)
 	}
 	if !probed {
 		t.Error("Verify did not leave the probe next to the record")
@@ -183,12 +198,17 @@ func TestOpenFromEnvironment(t *testing.T) {
 	} {
 		t.Setenv(k, v)
 	}
-	a, err := arbiter.Open("s3://" + testBucket + "/" + testKey)
-	if err != nil {
-		t.Fatal(err)
+	n := 0
+	open := func(t *testing.T) arbiter.Arbiter {
+		n++
+		a, err := arbiter.Open(fmt.Sprintf("s3://%s/%s-%d", testBucket, testKey, n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
 	}
-	castest.Exercise(t, a)
-	s := a.String()
+	arbitertest.Run(t, open)
+	s := open(t).String()
 	if strings.Contains(s, testSecret) || !strings.Contains(s, srv.URL) || !strings.Contains(s, "eu-central-1") {
 		t.Errorf("String() = %q, want the endpoint and region and no secret", s)
 	}
