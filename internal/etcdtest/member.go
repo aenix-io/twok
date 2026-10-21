@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -409,16 +408,6 @@ func isClosed(c chan struct{}) bool {
 	default:
 		return false
 	}
-}
-
-func freeAddr(t testing.TB) string {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	return l.Addr().String()
 }
 
 func tail(s string, lines int) string {
