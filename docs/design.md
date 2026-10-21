@@ -242,14 +242,14 @@ A backend lives in its own package, registers its URL scheme, and touches nothin
 | Scheme | Store | Version token | Conditional write |
 | --- | --- | --- | --- |
 | `s3://bucket/key` | S3-compatible object store | ETag | `PUT` with `If-Match`, `If-None-Match: *` to create |
-| `etcd://host:2379/key` | another etcd cluster | mod revision | transaction on `ModRevision` |
+| `etcd://host:2379,host2:2379/key`, `etcd+tls://...` | another etcd cluster | mod revision | transaction on `ModRevision` |
 | `kubernetes://namespace/name` | a ConfigMap in a Kubernetes API server | resourceVersion | update with the resourceVersion |
-| `http://host/path` | any HTTP service | ETag | `PUT` with `If-Match`, `If-None-Match: *` to create, `412` on mismatch |
+| `http://host/path`, `https://...` | any HTTP service, see [arbiter-http.md](arbiter-http.md) | ETag | `PUT` with `If-Match`, `If-None-Match: *` to create, `412` on mismatch |
 | `file:///path` | a local file, for tests | content hash | lock and rename |
 
 Not every S3-compatible store implements conditional writes, and some ignore the headers instead of rejecting them. twok verifies the conditional write on a probe key at startup and refuses to run against a store that does not honour it. The probe is a write next to the record, under the same prefix with a `.probe` suffix.
 
-The `http` contract is small enough for a Cloudflare Worker with a Durable Object, a few lines of any web framework, or `twok arbiter serve`, a reference implementation that keeps its records in a file. That server is a single point of failure for arbitration, not for writes, which is the trade-off the arbiter model makes everywhere.
+The `http` contract is small enough for a Cloudflare Worker with a Durable Object, a few lines of any web framework, or `twok arbiter serve`, a reference implementation that keeps its records in a directory. That server is a single point of failure for arbitration, not for writes, which is the trade-off the arbiter model makes everywhere.
 
 ## Manual intervention
 
