@@ -1,8 +1,12 @@
 # twok settings, one file per setting, read by the agent from /etc/twok
-# (--config-dir). A flag on the agent's command line wins over the file. The
-# name follows threek's convention, <cluster>-twok, which is also what
+# (--config-dir) before every poll. A flag on the agent's command line wins
+# over the file, and a missing ConfigMap means mode off. The name follows
+# threek's convention, <cluster>-twok, which is also what
 # deploy/twok-agent.yaml mounts into operator Pods. The arbiter URL is set by
 # the overlay in the StatefulSet's env, see statefulset.yaml.
+#
+# mode is off: the agent observes and logs only. Set it to dry-run to see the
+# decisions in the log, and to enforce to let twok act.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,8 +15,8 @@ metadata:
     app.kubernetes.io/name: etcd
     app.kubernetes.io/part-of: twok
 data:
+  mode: "off"
   poll-interval: 1s
   claim-after: 20s
   claim-delay: 3s
   follower-extra-delay: 5s
-  commit-tail: "true"

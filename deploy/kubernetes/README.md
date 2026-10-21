@@ -24,12 +24,13 @@ For clusters run by etcd-operator, [deploy/twok-agent.yaml](../twok-agent.yaml) 
 ## The member Pod
 
 - The container `etcd` runs the upstream etcd image with a plain etcd command line. Nothing in it knows about twok.
-- The init container `twok` with `restartPolicy: Always` is a native sidecar: it starts before etcd and runs next to it. It runs `twok-agent`, talks to etcd on `http://127.0.0.1:2379`, and mounts the same `data` volume at `/var/lib/etcd`, where it keeps its state file and sets the data directory aside on a rejoin.
+- The init container `twok` with `restartPolicy: Always` is a native sidecar: it starts before etcd and runs next to it. It runs `twok agent`, talks to etcd on `http://127.0.0.1:2379`, and mounts the same `data` volume at `/var/lib/etcd`, where it keeps its state file and sets the data directory aside on a rejoin.
 - `shareProcessNamespace: true` lets the agent find etcd's process and stop it. The kubelet then starts the etcd container again with the same command, and etcd finds what the agent left on the volume. Both containers run as UID 65532, so no capability is needed for the signal.
 - The Pod mirrors etcd-operator's member Pods: the label `etcd-operator.cozystack.io/cluster`, the container `etcd`, the volume `data` (and `tls-client`, `tls-peer` once TLS is on). That keeps one agent for both ways of running it.
 
 The agent's flags are written in one place, the `twok` container of `base/statefulset.yaml`.
-The other settings are files of the ConfigMap `etcd-twok`, mounted at `/etc/twok`; a flag wins over a file.
+The other settings are files of the ConfigMap `etcd-twok`, mounted at `/etc/twok` and read again before every poll; a flag wins over a file.
+The ConfigMap ships with `mode: "off"`, so a fresh deployment only observes; set `mode` to `enforce` to let twok act.
 
 | Setting | Where | Default | Meaning |
 | --- | --- | --- | --- |
@@ -37,11 +38,11 @@ The other settings are files of the ConfigMap `etcd-twok`, mounted at `/etc/twok
 | `--endpoint` | flag | `http://127.0.0.1:2379` | the local member |
 | `--data-dir` | flag | `/var/lib/etcd` | etcd's data directory, on the shared volume |
 | `--metrics-listen` | flag | `:2390` | Prometheus metrics |
+| `mode` | ConfigMap | `off` | `off` observes and logs, `dry-run` decides and logs, `enforce` acts; a missing ConfigMap means `off` |
 | `poll-interval` | ConfigMap | `1s` | how often the local member's status is read |
 | `claim-after` | ConfigMap | `20s` | how long the cluster must be without a leader before a claim |
 | `claim-delay` | ConfigMap | `3s` | the last leader's wait before the claim |
 | `follower-extra-delay` | ConfigMap | `5s` | the follower's extra wait |
-| `commit-tail` | ConfigMap | `true` | mark the whole log as committed before `--force-new-cluster` |
 
 The meaning of each setting is in [docs/design.md](../../docs/design.md#configuration).
 

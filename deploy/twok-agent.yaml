@@ -10,9 +10,10 @@
 # the kubelet then starts etcd again with the operator's command. It runs as
 # the Pod's user, which etcd-operator sets to 65532 for every container.
 #
-# The agent reads its settings, the arbiter URL included, from the ConfigMap
-# <cluster>-twok in the Pod's namespace, and must stay passive while that
-# ConfigMap does not exist.
+# The arbiter URL is taken from the Pod annotation twok.aenix.io/arbiter, set
+# through the cluster's spec.additionalMetadata.annotations. The other
+# settings come from the ConfigMap <cluster>-twok in the Pod's namespace; while
+# it does not exist, the agent runs in mode off and only observes.
 #
 # Not a supported way to run twok yet: etcd-operator still promotes learners
 # and reports two members as degraded, see docs/etcd-operator.md. This file is
@@ -69,9 +70,15 @@ spec:
         variables.etcdArgs.exists(a, a.startsWith("--data-dir="))
         ? variables.etcdArgs.filter(a, a.startsWith("--data-dir="))[0].substring(11)
         : "/var/lib/etcd"
+    - name: arbiter
+      expression: >-
+        has(object.metadata.annotations) && "twok.aenix.io/arbiter" in object.metadata.annotations
+        ? ["--arbiter=" + object.metadata.annotations["twok.aenix.io/arbiter"]]
+        : []
     # The agent's flags; the same names as in deploy/kubernetes/base.
     - name: args
       expression: >-
+        ["agent"] + variables.arbiter +
         [
           "--endpoint=" + (variables.clientTLS ? "https" : "http") + "://127.0.0.1:2379",
           "--data-dir=" + variables.dataDir,
@@ -101,7 +108,7 @@ spec:
                   name: "twok",
                   image: variables.image,
                   restartPolicy: "Always",
-                  command: ["twok-agent"],
+                  command: ["twok"],
                   args: variables.args,
                   ports: [Object.spec.initContainers.ports{name: "twok-metrics", containerPort: 2390}],
                   volumeMounts:

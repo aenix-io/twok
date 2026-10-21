@@ -12,7 +12,7 @@ The bench is `test/kubernetes/`, a Go test behind the build tag `kubernetes` tha
 
 - Cluster: five Talos v1.12.0 nodes, Kubernetes v1.33.1, Cilium 1.19.5 with kube-proxy replacement and `enable-policy=default`, the NFS CSI driver as the default StorageClass.
 - Members: the StatefulSet `etcd` of [deploy/kubernetes/base](../deploy/kubernetes/base), two replicas on different nodes, upstream etcd v3.6.15 pinned by digest, plain HTTP, default heartbeat (100 ms) and election timeout (1000 ms).
-  The baseline removes the twok sidecar (`test/kubernetes/manifests/baseline`); a twok run uses the `arbiter-http` overlay with the image in `TWOK_IMAGE`.
+  The baseline removes the twok sidecar (`test/kubernetes/manifests/baseline`); a twok run uses the `arbiter-http` overlay with the image in `TWOK_IMAGE` and sets `mode` in the ConfigMap to `TWOK_MODE`, `enforce` by default, since the manifests ship with `off`.
 - Writers: one Pod per member, on the member's node, writing `w/<member>/<seq>` with `etcdctl put` to its own member only, by the member's Pod DNS name, with 1 s dial and command timeouts.
   Each writer starts a put every 0.2 s plus the duration of the previous one and appends `seq,status,start_ms,end_ms` to a log in the Pod.
 - Probe: one Pod that runs `etcdctl endpoint status` against each member on its own once a second and logs the leader each member reports.
@@ -50,7 +50,7 @@ Both are read-only `kubectl exec` calls into the agent.
 export K8S_KUBECONFIG=<kubeconfig of the test cluster>   # K8S_NAMESPACE defaults to twok-test
 hack/kubernetes-bench.sh TestPartition                   # the baseline, plain etcd
 hack/kubernetes-bench.sh TestPartitionOneWay
-TWOK_IMAGE=ghcr.io/aenix-io/twok:main hack/kubernetes-bench.sh TestPartition
+TWOK_IMAGE=ghcr.io/aenix-io/twok:main hack/kubernetes-bench.sh TestPartition   # TWOK_MODE defaults to enforce
 hack/kubernetes-bench-clean.sh                           # lists what a failed run left; --yes deletes it
 ```
 

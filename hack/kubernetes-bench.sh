@@ -9,6 +9,7 @@
 #   K8S_NAMESPACE         namespace to work in, must exist (default twok-test)
 #   TWOK_IMAGE            twok image for the sidecar and the HTTP arbiter;
 #                         unset runs the plain etcd baseline without a sidecar
+#   TWOK_MODE             the agent's mode in a twok run (default enforce)
 #   TWOK_PARTITION_FOR    how long the partition lasts (default 60s)
 #   TWOK_HEAL_FOR         how long to watch at least after the heal (default 10s)
 #   TWOK_HEAL_TIMEOUT     how long to wait at most for the pair to recover (default 5m)

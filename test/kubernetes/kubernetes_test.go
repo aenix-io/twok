@@ -46,6 +46,7 @@ type config struct {
 	kubeconfig      string
 	namespace       string
 	twokImage       string
+	twokMode        string
 	ciliumNamespace string
 	partitionFor    time.Duration
 	healFor         time.Duration
@@ -61,6 +62,7 @@ func TestMain(m *testing.M) {
 		kubeconfig:      os.Getenv("K8S_KUBECONFIG"),
 		namespace:       envOr("K8S_NAMESPACE", "twok-test"),
 		twokImage:       os.Getenv("TWOK_IMAGE"),
+		twokMode:        envOr("TWOK_MODE", "enforce"),
 		ciliumNamespace: envOr("K8S_CILIUM_NAMESPACE", "cozy-cilium"),
 		partitionFor:    durationEnv("TWOK_PARTITION_FOR", 60*time.Second),
 		healFor:         durationEnv("TWOK_HEAL_FOR", 10*time.Second),
@@ -103,7 +105,7 @@ func (c config) mode() string {
 	if c.baseline() {
 		return "baseline (upstream etcd, no arbiter)"
 	}
-	return "twok " + c.twokImage + " as a sidecar, HTTP arbiter from the same image"
+	return "twok " + c.twokImage + " as a sidecar in mode " + c.twokMode + ", HTTP arbiter from the same image"
 }
 
 type env struct {
@@ -190,7 +192,7 @@ func (e *env) deleteFile(path string) {
 
 // membersManifest renders the member manifests: the baseline without the
 // sidecar, or the arbiter-http overlay with TWOK_IMAGE for the sidecar and
-// the arbiter.
+// the arbiter, and TWOK_MODE in the ConfigMap.
 func (e *env) membersManifest() string {
 	e.t.Helper()
 	dir := "manifests/baseline"
@@ -204,6 +206,7 @@ func (e *env) membersManifest() string {
 	manifest := string(out)
 	if !cfg.baseline() {
 		manifest = regexp.MustCompile(`ghcr\.io/aenix-io/twok:\S+`).ReplaceAllLiteralString(manifest, cfg.twokImage)
+		manifest = strings.Replace(manifest, `mode: "off"`, "mode: "+cfg.twokMode, 1)
 	}
 	return manifest
 }

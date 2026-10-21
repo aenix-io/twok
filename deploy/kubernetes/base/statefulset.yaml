@@ -61,11 +61,12 @@ spec:
           image: twok
           restartPolicy: Always
           command:
-            - twok-agent
+            - twok
           # The agent's flags are set here and nowhere else in the
           # StatefulSet. The other settings are files in the ConfigMap
           # etcd-twok, mounted at /etc/twok.
           args:
+            - agent
             - --arbiter=$(TWOK_ARBITER)
             - --endpoint=http://127.0.0.1:2379
             - --data-dir=/var/lib/etcd
