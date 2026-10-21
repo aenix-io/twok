@@ -252,7 +252,9 @@ func (c *cluster) startMember(m *member, initialCluster, mode string) {
 	t := c.t
 	mustDocker(t, "volume", "create", m.volume)
 	t.Cleanup(func() { _, _ = docker("volume", "rm", "--force", m.volume) })
-	// A new volume belongs to root; etcd creates its files as 65532.
+	// A new volume belongs to root; etcd creates its files as 65532. The
+	// mounts below say nocopy, or docker would copy the etcd image's own
+	// /var/lib/etcd, owner and mode included, over this on the first mount.
 	mustDocker(t, "run", "--rm", "--volume", m.volume+":"+dataDir, nettools,
 		"sh", "-c", "chown 65532:65532 "+dataDir+" && chmod 0700 "+dataDir)
 
@@ -278,7 +280,7 @@ func (c *cluster) startMember(m *member, initialCluster, mode string) {
 		"--network", "container:" + m.pod, "--pid", "container:" + m.pod,
 		"--user", user, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
 		"--restart", "always",
-		"--volume", m.volume + ":" + dataDir,
+		"--volume", m.volume + ":" + dataDir + ":nocopy",
 		"--volume", c.pkiDir + ":" + pki + ":ro",
 	}
 
