@@ -134,7 +134,14 @@ func TestRejoinWithNewID(t *testing.T) {
 					<-loser.Exited()
 				}
 			})
-			st := waitCaughtUp(t, survivor, loser, newID)
+			st, err := waitCaughtUp(t, survivor, loser, newID)
+			if err != nil {
+				if tt.control {
+					t.Logf("step 4: control outcome: %v; log lines of interest:\n%s", err, interesting(loser.Log(t)))
+					return
+				}
+				t.Fatal(err)
+			}
 			t.Logf("step 4: the loser started with its original flags and is learner %x at applied index %d", newID, st.RaftAppliedIndex)
 			log := loser.Log(t)
 			snapshotted := strings.Contains(log, "applied snapshot") || strings.Contains(strings.ToLower(log), "applied incoming raft snapshot")
@@ -157,7 +164,9 @@ func TestRejoinWithNewID(t *testing.T) {
 				t.Fatalf("voters after promotion: %v", voters)
 			}
 			// A write now needs the loser's acknowledgement.
-			writeKeys(t, survivor, "/phase3/", 10)
+			promoted := time.Now()
+			writeKeysPatient(t, survivor, "/phase3/", 10)
+			t.Logf("step 6a: 10 writes after the promotion took %s", time.Since(promoted).Round(10*time.Millisecond))
 			waitCount(t, loser, "/phase3/", 10)
 
 			onSurvivor, onLoser := allKeys(t, survivor), allKeys(t, loser)
@@ -216,7 +225,7 @@ func proposeCutOff(t *testing.T, cl *etcdtest.Cluster, leader *etcdtest.Member) 
 // an entry after the snapshot, and serves no client request before it has
 // published. Without traffic it waits forever; the fresh-learner case shows
 // that this is etcd's behaviour, not a consequence of Reidentify.
-func waitCaughtUp(t *testing.T, survivor, loser *etcdtest.Member, newID uint64) *clientv3.StatusResponse {
+func waitCaughtUp(t *testing.T, survivor, loser *etcdtest.Member, newID uint64) (*clientv3.StatusResponse, error) {
 	t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
 	nudges := 0
@@ -224,13 +233,15 @@ func waitCaughtUp(t *testing.T, survivor, loser *etcdtest.Member, newID uint64) 
 	for i := 0; ; i++ {
 		select {
 		case <-loser.Exited():
-			t.Fatalf("the loser exited (%v); log lines of interest:\n%s", loser.ExitErr(), interesting(loser.Log(t)))
+			return nil, fmt.Errorf("the loser exited: %w", loser.ExitErr())
 		default:
 		}
 		sst, serr := survivor.Status(t)
 		lst, lerr := loser.Status(t)
-		if serr == nil && lerr == nil && lst.Header.MemberId == newID && lst.IsLearner && lst.RaftAppliedIndex >= sst.RaftIndex {
-			return lst
+		// Status is answered before the member serves reads; a read tells
+		// that it has published itself and is ready.
+		if serr == nil && lerr == nil && lst.Header.MemberId == newID && lst.IsLearner && lst.RaftAppliedIndex >= sst.RaftIndex && serves(t, loser) {
+			return lst, nil
 		}
 		if i%5 == 4 {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -242,11 +253,20 @@ func waitCaughtUp(t *testing.T, survivor, loser *etcdtest.Member, newID uint64) 
 			cancel()
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the loser did not catch up as learner %x: %+v, %v; survivor %+v, %v; log lines of interest:\n%s",
+			return nil, fmt.Errorf("the loser did not catch up as learner %x: %+v, %w; survivor %+v, %w; log lines of interest:\n%s",
 				newID, lst, lerr, sst, serr, interesting(loser.Log(t)))
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// serves reports whether m answers a serializable read within a second.
+func serves(t *testing.T, m *etcdtest.Member) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := m.Client(t).Get(ctx, "/", clientv3.WithSerializable(), clientv3.WithCountOnly())
+	return err == nil
 }
 
 func promote(ctx context.Context, t *testing.T, survivor *etcdtest.Member, id uint64) {
@@ -268,6 +288,20 @@ func writeKeys(t *testing.T, m *etcdtest.Member, prefix string, n int) {
 	t.Helper()
 	for i := range n {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := m.Client(t).Put(ctx, fmt.Sprintf("%s%04d", prefix, i), "v")
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// writeKeysPatient writes like writeKeys, with up to 30 seconds per write:
+// the first writes after a promotion wait for the new voter's connections.
+func writeKeysPatient(t *testing.T, m *etcdtest.Member, prefix string, n int) {
+	t.Helper()
+	for i := range n {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_, err := m.Client(t).Put(ctx, fmt.Sprintf("%s%04d", prefix, i), "v")
 		cancel()
 		if err != nil {
