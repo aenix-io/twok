@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aenix-io/twok/internal/arbiter"
@@ -29,6 +30,14 @@ type fake struct {
 }
 
 var errUnreachable = errors.New("store unreachable")
+
+// registered counts the schemes the tests register. The registry lives as
+// long as the process, so a scheme must not repeat, not even with -count.
+var registered atomic.Uint64
+
+func scheme(base string) string {
+	return base + "-" + strconv.FormatUint(registered.Add(1), 10)
+}
 
 func (f *fake) Read(context.Context) (arbiter.Record, arbiter.Version, error) {
 	f.mu.Lock()
@@ -71,11 +80,12 @@ func (*fake) String() string { return "fake" }
 func TestOpen(t *testing.T) {
 	var got *url.URL
 	want := &fake{}
-	arbiter.Register("test-open", func(u *url.URL) (arbiter.Arbiter, error) {
+	name := scheme("test-open")
+	arbiter.Register(name, func(u *url.URL) (arbiter.Arbiter, error) {
 		got = u
 		return want, nil
 	})
-	a, err := arbiter.Open("test-open://bucket/clusters/prod")
+	a, err := arbiter.Open(name + "://bucket/clusters/prod")
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -85,28 +95,30 @@ func TestOpen(t *testing.T) {
 	if got.Host != "bucket" || got.Path != "/clusters/prod" {
 		t.Errorf("factory got %v, want host bucket and path /clusters/prod", got)
 	}
-	if !slices.Contains(arbiter.Schemes(), "test-open") {
-		t.Errorf("Schemes() = %v, want test-open in it", arbiter.Schemes())
+	if !slices.Contains(arbiter.Schemes(), name) {
+		t.Errorf("Schemes() = %v, want %s in it", arbiter.Schemes(), name)
 	}
 }
 
 func TestOpenFactoryError(t *testing.T) {
-	arbiter.Register("test-error", func(*url.URL) (arbiter.Arbiter, error) {
+	name := scheme("test-error")
+	arbiter.Register(name, func(*url.URL) (arbiter.Arbiter, error) {
 		return nil, errUnreachable
 	})
-	if _, err := arbiter.Open("test-error://x"); !errors.Is(err, errUnreachable) {
+	if _, err := arbiter.Open(name + "://x"); !errors.Is(err, errUnreachable) {
 		t.Errorf("Open() error = %v, want the factory's error", err)
 	}
 }
 
 func TestOpenUnknownScheme(t *testing.T) {
-	arbiter.Register("test-known", func(*url.URL) (arbiter.Arbiter, error) { return &fake{}, nil })
+	known := scheme("test-known")
+	arbiter.Register(known, func(*url.URL) (arbiter.Arbiter, error) { return &fake{}, nil })
 	_, err := arbiter.Open("nosuch://x")
 	if err == nil {
 		t.Fatal("Open() of an unknown scheme succeeded")
 	}
 	// The error lists what would have worked.
-	if !strings.Contains(err.Error(), `"nosuch"`) || !strings.Contains(err.Error(), "test-known") {
+	if !strings.Contains(err.Error(), `"nosuch"`) || !strings.Contains(err.Error(), known) {
 		t.Errorf("Open() error = %q, want the scheme and the known schemes in it", err)
 	}
 }
@@ -119,19 +131,20 @@ func TestOpenInvalidURL(t *testing.T) {
 
 func TestRegisterTwice(t *testing.T) {
 	f := func(*url.URL) (arbiter.Arbiter, error) { return &fake{}, nil }
-	arbiter.Register("test-twice", f)
+	name := scheme("test-twice")
+	arbiter.Register(name, f)
 	defer func() {
 		if recover() == nil {
 			t.Error("a second Register of one scheme did not panic")
 		}
 	}()
-	arbiter.Register("test-twice", f)
+	arbiter.Register(name, f)
 }
 
 func TestSchemesSorted(t *testing.T) {
 	f := func(*url.URL) (arbiter.Arbiter, error) { return &fake{}, nil }
-	arbiter.Register("test-sort-b", f)
-	arbiter.Register("test-sort-a", f)
+	arbiter.Register(scheme("test-sort-b"), f)
+	arbiter.Register(scheme("test-sort-a"), f)
 	if s := arbiter.Schemes(); !slices.IsSorted(s) {
 		t.Errorf("Schemes() = %v, want sorted", s)
 	}
