@@ -245,6 +245,107 @@ func TestRejoinReusesTheLearnerAndChecksTheSurvivor(t *testing.T) {
 	}
 }
 
+// removedHarness is member a after b took over generation 1 while a was cut
+// off: a's etcd learned from b that it was removed, before a's agent read
+// the arbiter, and now exits in a loop.
+func removedHarness(t *testing.T) *harness {
+	t.Helper()
+	h := newHarness(t, fastConfig(config.ModeEnforce))
+	h.ticks(1)
+	if _, err := h.arb.CompareAndSwap(context.Background(), arbiter.Zero, arbiter.Record{
+		SchemaVersion: 1, ClusterID: "c1", Generation: 1, Survivor: "b", SurvivorMemberID: "b", Reason: "no-leader",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.local.set(func(f *fakeMember) { f.down = true })
+	return h
+}
+
+func TestRejoinWhenEtcdExitedAsRemoved(t *testing.T) {
+	h := removedHarness(t)
+	h.ticks(10)
+	if len(h.peer.added) != 1 || len(h.wal.reids) != 1 || h.wal.reids[0] != 0x101 {
+		t.Fatalf("added %v, reidentify %x; want a rejoin while etcd does not answer:\n%s", h.peer.added, h.wal.reids, h.logs)
+	}
+	if h.wal.inspects == 0 {
+		t.Error("the WAL was not read while etcd did not answer")
+	}
+	if got := testutil.ToFloat64(h.agent.metrics.rejoins.WithLabelValues("success")); got != 1 {
+		t.Errorf("twok_rejoins_total{result=success} = %v", got)
+	}
+}
+
+func TestRejoinAfterTwokRestartedDuringTheCrashLoop(t *testing.T) {
+	h := removedHarness(t)
+	// A new agent: it never saw etcd answer, so it knows neither the
+	// generation nor the member list. The WAL says who it is, the flag
+	// where the survivor is.
+	h.agent = New(Options{
+		Config: fastConfig(config.ModeEnforce), Local: h.local, Arbiter: h.arb, WAL: h.wal, Process: h.proc,
+		DataDir: "/var/lib/etcd", PeerEndpoint: h.peer.endpoint, Logger: h.agent.logger, Now: h.agent.now,
+		Dial: func(string) (Client, error) { return h.peer, nil },
+	})
+	h.agent.waitInterval = time.Millisecond
+	h.ticks(10)
+	if len(h.wal.reids) != 1 {
+		t.Fatalf("reidentify %x, want one rejoin:\n%s", h.wal.reids, h.logs)
+	}
+	if !strings.Contains(h.logs.String(), "etcd does not answer and the arbiter names b the survivor of generation 1") {
+		t.Errorf("logs:\n%s", h.logs)
+	}
+
+	// Without the peer endpoint there is no way to the survivor: an error,
+	// and nothing changes.
+	h2 := removedHarness(t)
+	h2.agent = New(Options{
+		Config: fastConfig(config.ModeEnforce), Local: h2.local, Arbiter: h2.arb, WAL: h2.wal, Process: h2.proc,
+		DataDir: "/var/lib/etcd", Logger: h2.agent.logger, Now: h2.agent.now,
+		Dial: func(string) (Client, error) { return h2.peer, nil },
+	})
+	h2.ticks(10)
+	if len(h2.peer.added)+len(h2.wal.reids) != 0 || !strings.Contains(h2.logs.String(), "set --peer-endpoint") {
+		t.Errorf("added %v, reidentify %x:\n%s", h2.peer.added, h2.wal.reids, h2.logs)
+	}
+}
+
+func TestRejoinAlreadyDoneOnlyWaits(t *testing.T) {
+	h := removedHarness(t)
+	// The edit was done before twok restarted: the WAL carries the
+	// learner's ID, and the survivor lists it.
+	h.local.set(func(f *fakeMember) { f.st.MemberID = 0x177 })
+	h.peer.set(func(f *fakeMember) {
+		f.members.Learners = []engine.Member{{ID: 0x177, PeerURLs: []string{"https://a:2380"}}}
+	})
+	h.ticks(10)
+	if len(h.peer.added) != 0 || len(h.wal.reids) != 0 || h.proc.stops != 0 {
+		t.Fatalf("added %v, reidentify %x, stops %d; want only a wait", h.peer.added, h.wal.reids, h.proc.stops)
+	}
+	if h.proc.resumes == 0 || !strings.Contains(h.logs.String(), "already the survivor's learner") {
+		t.Errorf("resumes %d:\n%s", h.proc.resumes, h.logs)
+	}
+}
+
+func TestDownMemberStillListedByTheSurvivorIsNotStale(t *testing.T) {
+	h := removedHarness(t)
+	// The record names b, but b leads with this member's ID as its only
+	// voter: b is this member, reached through a wrong endpoint, or the
+	// record is wrong. Either way it is no proof of a takeover.
+	h.peer.set(func(f *fakeMember) {
+		f.st.MemberID, f.st.Leader = 0xb, 0xb
+		f.members.Voters = []engine.Member{memberEntry(0xa, "a")}
+	})
+	h.wal.mu.Lock()
+	h.wal.local.st.MemberID = 0xa
+	h.wal.mu.Unlock()
+	h.ticks(10)
+	if len(h.peer.added)+len(h.wal.reids) != 0 {
+		t.Fatalf("added %v, reidentify %x", h.peer.added, h.wal.reids)
+	}
+	if !strings.Contains(h.logs.String(), "is this member, a") {
+		t.Errorf("the refusal is not logged:\n%s", h.logs)
+	}
+}
+
 func TestPromote(t *testing.T) {
 	h := newHarness(t, fastConfig(config.ModeEnforce))
 	h.local.set(func(f *fakeMember) {

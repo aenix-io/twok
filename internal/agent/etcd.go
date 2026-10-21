@@ -163,8 +163,17 @@ func (w WALOps) Cleanup(dataDir string) error {
 	return walops.Cleanup(walops.WALDir(dataDir))
 }
 
-// Inspect describes the WAL for twok status.
-func (w WALOps) Inspect(dataDir string) (walops.State, error) {
+// Inspect implements WAL.
+func (w WALOps) Inspect(dataDir string) (engine.WALState, error) {
+	st, err := w.State(dataDir)
+	if err != nil {
+		return engine.WALState{}, err
+	}
+	return engine.WALState{MemberID: st.MemberID, ClusterID: st.ClusterID, Members: st.Members}, nil
+}
+
+// State describes the WAL in full, for twok status.
+func (w WALOps) State(dataDir string) (walops.State, error) {
 	return walops.Inspect(w.Logger, walops.WALDir(dataDir))
 }
 
