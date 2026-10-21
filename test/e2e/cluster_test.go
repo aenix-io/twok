@@ -27,6 +27,8 @@ import (
 	"go.etcd.io/etcd/client/pkg/v3/transport"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 
 	"github.com/aenix-io/twok/internal/arbiter"
 	_ "github.com/aenix-io/twok/internal/arbiter/httparb"
@@ -337,6 +339,13 @@ func (c *cluster) startMember(m *member, initialCluster, mode string) {
 		DialTimeout: time.Second,
 		TLS:         tlsCfg,
 		Logger:      zap.NewNop(),
+		// A member that was down for a minute is dialed again within a
+		// second of its return, so that the writes measure etcd and not
+		// gRPC's reconnect backoff, which grows to two minutes.
+		DialOptions: []grpc.DialOption{grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff:           backoff.Config{BaseDelay: 100 * time.Millisecond, Multiplier: 1.6, MaxDelay: time.Second},
+			MinConnectTimeout: time.Second,
+		})},
 	})
 	if err != nil {
 		t.Fatal(err)
