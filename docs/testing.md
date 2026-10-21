@@ -47,6 +47,22 @@ On 3.6.15 a member that caught up through a snapshot does not publish itself or 
 - With `--snapshot-count=10 --max-wals=2` the first WAL segment is gone; the operations open the WAL at the newest snapshot and the last key survives the restart.
 - A promotion right after `AddLearner` fails with "learner not ready" and succeeds after two or three retries.
 
+### Integration tests with real etcd
+
+`internal/agent` runs two agents in one process against two real etcd members connected through TCP proxies, with the `memory://` arbiter, on both etcd versions (`go test -race ./internal/agent/` with `TEST_ETCD_BINARY`, about four minutes per version).
+With the default settings and the link cut in both directions:
+
+| | etcd 3.6.15 | etcd 3.5.34 |
+| --- | --- | --- |
+| First accepted write on the survivor after the cut | 29.4 to 30.6 s | 29.9 s |
+| Pair restored after the heal | 5.4 to 9.9 s | 9.5 s |
+
+The survivor was the last leader in every run, as the delays intend, and every acknowledged write was present on both members afterwards.
+The same tests show that nobody serves writes while the arbiter is unreachable, that the loser stays stale when the survivor dies before the rejoin and rejoins when it is back, and that `dry-run` never touches the arbiter.
+
+A cut of one proxy direction does not produce a one-way partition for Raft: each member dials the other, and etcd falls back from its streams to its pipeline connections, so messages still flow both ways through the connections the other member dialed, and no leader is lost.
+A one-way partition needs packets dropped by direction, which the Kubernetes bench does with a Cilium egress policy; the proxy test only checks that nothing unsafe happens.
+
 ## Kubernetes test bench
 
 A two-member etcd on a real Kubernetes cluster, partitioned with Cilium network policies.
