@@ -49,8 +49,8 @@ type site struct {
 	mu sync.Mutex
 	// down keeps etcd stopped: the site has lost power.
 	down bool
-	// starting is set while the supervisor waits to restart etcd.
-	starting bool
+	// restarts counts the supervisor's restarts of etcd.
+	restarts int
 }
 
 // world is the two sites, the link between them and the arbiter.
@@ -68,13 +68,20 @@ var worlds atomic.Int64
 
 func newWorld(t *testing.T, cfg config.Config) *world {
 	t.Helper()
+	return newWorldPerSite(t, cfg, cfg)
+}
+
+// newWorldPerSite starts the agent of m0 with cfg0 and the one of m1 with
+// cfg1, as two ConfigMaps or two sets of flags would.
+func newWorldPerSite(t *testing.T, cfg0, cfg1 config.Config) *world {
+	t.Helper()
 	w := &world{t: t, cl: etcdtest.StartPair(t), arbName: fmt.Sprintf("integration/%s/%d", t.Name(), worlds.Add(1))}
 	for _, m := range w.cl.Members {
 		s := &site{t: t, m: m, extra: m.ExtraArgs(), logs: &lockedBuffer{}, arb: &switchArbiter{Arbiter: memarb.New(w.arbName)}}
 		w.sites = append(w.sites, s)
 	}
-	for _, s := range w.sites {
-		w.startAgent(s, cfg)
+	for i, s := range w.sites {
+		w.startAgent(s, []config.Config{cfg0, cfg1}[i])
 	}
 	t.Cleanup(func() {
 		for _, s := range w.sites {
@@ -133,47 +140,50 @@ func (s *site) stopAgent() {
 	}
 }
 
-// supervise restarts etcd after it exits, as the kubelet does.
+// supervise restarts etcd after it exits, as the kubelet does: after a
+// delay that doubles with every exit that follows a short run, up to
+// maxRestartDelay, and starts over after a run of ten seconds.
 func (s *site) supervise(ctx context.Context) {
+	delay := time.Second
 	for {
+		started := time.Now()
 		select {
 		case <-ctx.Done():
 			return
 		case <-s.m.Exited():
 		}
-		s.mu.Lock()
-		s.starting = true
-		s.mu.Unlock()
+		if time.Since(started) > 10*time.Second {
+			delay = time.Second
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(time.Second):
+		case <-time.After(delay):
 		}
-		s.mu.Lock()
-		if !s.down && !s.m.Running() {
-			s.m.Start(s.t, s.extra...)
-		}
-		s.starting = false
-		down := s.down
-		s.mu.Unlock()
-		if down {
-			// Wait for powerOn to start it.
-			for {
-				s.mu.Lock()
-				d := s.down
+		delay = min(2*delay, maxRestartDelay)
+		for {
+			s.mu.Lock()
+			if !s.down {
+				if !s.m.Running() {
+					s.restarts++
+					s.m.Start(s.t, s.extra...)
+				}
 				s.mu.Unlock()
-				if !d {
-					break
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(100 * time.Millisecond):
-				}
+				break
+			}
+			s.mu.Unlock()
+			// The site is off; powerOn starts etcd.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
 			}
 		}
 	}
 }
+
+// maxRestartDelay is the kubelet's five minutes, shortened for the tests.
+const maxRestartDelay = 16 * time.Second
 
 func (s *site) powerOff() {
 	s.mu.Lock()
@@ -676,6 +686,56 @@ func TestIntegrationDryRun(t *testing.T) {
 	}
 	w.heal()
 	w.waitPaired(0, time.Minute)
+}
+
+// TestIntegrationRemovedBeforeTheArbiterWasRead forces the order seen on
+// the Kubernetes bench with a one-way cut: the loser's etcd learns from the
+// survivor that it was removed before the loser's own isolation led it to
+// the arbiter, exits, and is restarted in a loop with a growing delay. The
+// loser never reads the arbiter while etcd runs, because its claim-after is
+// an hour; it has to find out from the arbiter while etcd is down, and
+// rejoin.
+func TestIntegrationRemovedBeforeTheArbiterWasRead(t *testing.T) {
+	slow := fast(config.ModeEnforce)
+	slow.ClaimAfter = time.Hour
+	w := newWorldPerSite(t, slow, fast(config.ModeEnforce))
+	loser, survivor := w.sites[0], w.sites[1]
+	w.waitPaired(0, 30*time.Second)
+	wr := w.startWriter()
+	w.cut()
+	waitFor(t, time.Minute, "m1 serving alone", func() bool {
+		rec, ok := w.record()
+		return ok && rec.Survivor == survivor.m.Name && survivor.generation() == 1
+	})
+	healed := time.Now()
+	w.heal()
+	waitFor(t, time.Minute, "m0's etcd exiting as removed", func() bool {
+		loser.mu.Lock()
+		defer loser.mu.Unlock()
+		return loser.restarts > 0
+	})
+	w.waitPaired(1, 4*time.Minute)
+	paired := time.Since(healed)
+	// The agent notices etcd's return at its own pace; the rejoin is done
+	// when it does.
+	waitFor(t, 2*time.Minute, "m0's agent seeing etcd back", func() bool {
+		return strings.Contains(loser.logs.String(), `"msg":"rejoin: etcd runs as the new learner"`)
+	})
+	loser.mu.Lock()
+	restarts := loser.restarts
+	loser.mu.Unlock()
+	t.Logf("TIMELINE removed before the arbiter was read: pair at generation 1 %.1fs after the heal, m0's etcd restarted %d times",
+		paired.Seconds(), restarts)
+	logs := loser.logs.String()
+	// m0 went from unknown, with etcd down, straight to stale: it read
+	// the arbiter only because etcd stopped answering.
+	if !strings.Contains(logs, `"role":"stale","note":"generation 0 is behind the arbiter's 1 (survivor m1), rejoining as a learner","generation":0,"mode":"enforce","from":"unknown"`) {
+		t.Errorf("m0 did not find out it was stale while etcd was down:\n%s", tail(logs, 30))
+	}
+	if strings.Contains(logs, `"action":"claim"`) {
+		t.Error("m0 claimed")
+	}
+	w.checkAcked(wr.halt())
 }
 
 // lockedBuffer collects an agent's log.
