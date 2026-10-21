@@ -1,0 +1,58 @@
+# Cuts etcd-0 from etcd-1 in both directions: each member denies egress to
+# the other and ingress from the other. Nothing else is touched.
+#
+# The policies select the members by twok.aenix.io/member, a label the harness
+# puts on each member Pod. statefulset.kubernetes.io/pod-name would be the
+# natural choice, but Cilium leaves it out of the security identity by default
+# (it is one of the high-cardinality labels in the default label filter), so
+# a policy that selects on it selects nothing.
+#
+# enableDefaultDeny is off in both directions: a policy that selects a Pod
+# would otherwise put it into default deny for every direction the policy
+# has rules for, and cut it from everything, the arbiter and the writers
+# included. Only the deny rules apply.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: twok-partition-etcd-0
+  labels:
+    app.kubernetes.io/name: twok-bench-partition
+    app.kubernetes.io/part-of: twok
+spec:
+  endpointSelector:
+    matchLabels:
+      twok.aenix.io/member: etcd-0
+  enableDefaultDeny:
+    ingress: false
+    egress: false
+  egressDeny:
+    - toEndpoints:
+        - matchLabels:
+            twok.aenix.io/member: etcd-1
+  ingressDeny:
+    - fromEndpoints:
+        - matchLabels:
+            twok.aenix.io/member: etcd-1
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: twok-partition-etcd-1
+  labels:
+    app.kubernetes.io/name: twok-bench-partition
+    app.kubernetes.io/part-of: twok
+spec:
+  endpointSelector:
+    matchLabels:
+      twok.aenix.io/member: etcd-1
+  enableDefaultDeny:
+    ingress: false
+    egress: false
+  egressDeny:
+    - toEndpoints:
+        - matchLabels:
+            twok.aenix.io/member: etcd-0
+  ingressDeny:
+    - fromEndpoints:
+        - matchLabels:
+            twok.aenix.io/member: etcd-0

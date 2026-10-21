@@ -34,3 +34,6 @@ go.work.sum
 
 # Build output
 bin/
+
+# Raw records of the Kubernetes bench; curated copies are kept as .md
+test/kubernetes/results/*.log

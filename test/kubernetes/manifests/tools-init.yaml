@@ -1,0 +1,33 @@
+# The init container shared by the writers and the probe, indented into their
+# initContainers by the harness. The etcd image has no shell, so etcdctl is
+# taken from the release archive, checked against the pinned checksum, and put
+# into the tools volume, next to a copy of busybox for wget.
+- name: etcdctl
+  image: {{ .FetchImage }}
+  command:
+    - /bin/sh
+    - -c
+    - |
+      set -eu
+      cd /tools
+      wget -q -O etcd.tar.gz "https://github.com/etcd-io/etcd/releases/download/{{ .EtcdVersion }}/etcd-{{ .EtcdVersion }}-linux-amd64.tar.gz"
+      echo "{{ .EtcdSHA256 }}  etcd.tar.gz" | sha256sum -c
+      tar -xzf etcd.tar.gz --strip-components=1 "etcd-{{ .EtcdVersion }}-linux-amd64/etcdctl"
+      rm etcd.tar.gz
+      cp /bin/busybox /tools/busybox
+      ./etcdctl version
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  volumeMounts:
+    - name: tools
+      mountPath: /tools

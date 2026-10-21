@@ -1,0 +1,63 @@
+# The probe, a Go text/template filled in by the harness. It reads the status
+# of each member on its own, once a second, and appends one line per member to
+# /log/status.log as "<unix ms> <member> <etcdctl endpoint status JSON>". The
+# harness also runs its one-off etcdctl commands in it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe
+  labels:
+    app.kubernetes.io/name: twok-bench-probe
+    app.kubernetes.io/part-of: twok
+spec:
+  restartPolicy: Never
+  enableServiceLinks: false
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+{{ .ToolsInit }}
+  containers:
+    - name: probe
+      image: {{ .ShellImage }}
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -u
+          while :; do
+            for member in etcd-0 etcd-1; do
+              now=$(date +%s%3N)
+              status=$(/tools/etcdctl --endpoints="http://$member.etcd:2379" --dial-timeout=1s --command-timeout=1s \
+                endpoint status --write-out=json 2>&1 | tr -d '\n')
+              echo "$now $member $status" >>/log/status.log
+            done
+            sleep 1
+          done
+      resources:
+        requests:
+          cpu: 20m
+          memory: 32Mi
+        limits:
+          memory: 64Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: tools
+          mountPath: /tools
+        - name: log
+          mountPath: /log
+  volumes:
+    - name: tools
+      emptyDir: {}
+    - name: log
+      emptyDir: {}

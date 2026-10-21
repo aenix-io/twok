@@ -1,0 +1,21 @@
+# The arbiter: one etcd member, plaintext, in the same namespace. The operator
+# creates the client Service arbiter-client. One member is enough: the arbiter
+# is not on the write path, and a lost arbiter only stops takeovers.
+apiVersion: etcd-operator.cozystack.io/v1alpha2
+kind: EtcdCluster
+metadata:
+  name: arbiter
+  labels:
+    app.kubernetes.io/name: twok-arbiter
+    app.kubernetes.io/part-of: twok
+spec:
+  replicas: 1
+  version: 3.6.15
+  storage:
+    size: 1Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi

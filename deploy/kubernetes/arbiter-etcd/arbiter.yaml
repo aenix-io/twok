@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: twok
+          env:
+            - name: TWOK_ARBITER
+              value: etcd://arbiter-client:2379/twok/etcd

@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - configmap.yaml
+  - service.yaml
+  - statefulset.yaml
+  - pdb.yaml
+# The one place where the images are set.
+images:
+  # gcr.io/etcd-development/etcd:v3.6.15, the multi-arch index digest, read
+  # from the registry on 2026-10-21.
+  - name: etcd
+    newName: gcr.io/etcd-development/etcd
+    digest: sha256:5ed4e32061aa061f970d6500629213e8579ef17571dcf9789074966acb9afad1
+  # The development tag moves with every push to main; pin a digest for
+  # anything that should stay put, for example newTag: main@sha256:<digest>.
+  - name: twok
+    newName: ghcr.io/aenix-io/twok
+    newTag: main
