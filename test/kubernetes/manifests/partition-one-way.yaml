@@ -1,0 +1,46 @@
+# Cuts one direction only: etcd-0 cannot open connections to etcd-1, and
+# etcd-1 accepts none from etcd-0. etcd-1 can still open connections to
+# etcd-0, and the replies on those flow back, because Cilium's policy is
+# applied per connection and replies of an allowed connection are allowed.
+#
+# In etcd's peer transport the receiver opens the stream it reads from, so
+# this lets etcd-0's messages reach etcd-1 over etcd-1's own streams, and
+# stops etcd-1's messages to etcd-0. See partition.yaml for the label and
+# the default-deny notes.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: twok-partition-one-way-etcd-0
+  labels:
+    app.kubernetes.io/name: twok-bench-partition
+    app.kubernetes.io/part-of: twok
+spec:
+  endpointSelector:
+    matchLabels:
+      twok.aenix.io/member: etcd-0
+  enableDefaultDeny:
+    ingress: false
+    egress: false
+  egressDeny:
+    - toEndpoints:
+        - matchLabels:
+            twok.aenix.io/member: etcd-1
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: twok-partition-one-way-etcd-1
+  labels:
+    app.kubernetes.io/name: twok-bench-partition
+    app.kubernetes.io/part-of: twok
+spec:
+  endpointSelector:
+    matchLabels:
+      twok.aenix.io/member: etcd-1
+  enableDefaultDeny:
+    ingress: false
+    egress: false
+  ingressDeny:
+    - fromEndpoints:
+        - matchLabels:
+            twok.aenix.io/member: etcd-0

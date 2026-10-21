@@ -1,0 +1,14 @@
+# The baseline: the two-member StatefulSet of deploy/kubernetes/base without
+# the twok sidecar. This is what Raft alone does with two voters, and what
+# twok is compared against.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../../deploy/kubernetes/base
+patches:
+  - target:
+      kind: StatefulSet
+      name: etcd
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/initContainers

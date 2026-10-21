@@ -1,0 +1,49 @@
+# Empties a member's volume before its claim is deleted, a Go text/template
+# filled in by the harness. etcd creates its directories with mode 0700 as
+# UID 65532, and an NFS provisioner that deletes the volume's directory as
+# another user then fails with "permission denied" and leaves the volume
+# Released forever. Removing the files as the same user first avoids that.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wipe-{{ .Claim }}
+  labels:
+    app.kubernetes.io/name: twok-bench-wipe
+    app.kubernetes.io/part-of: twok
+spec:
+  restartPolicy: Never
+  enableServiceLinks: false
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: wipe
+      image: {{ .Image }}
+      command:
+        - /bin/sh
+        - -c
+        - find /volume -mindepth 1 -delete && ls -la /volume
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 64Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: volume
+          mountPath: /volume
+  volumes:
+    - name: volume
+      persistentVolumeClaim:
+        claimName: {{ .Claim }}

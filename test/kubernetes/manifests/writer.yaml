@@ -1,0 +1,75 @@
+# A writer for one member, a Go text/template filled in by the harness. It
+# runs on the node of its member and talks to that member alone, by its Pod
+# DNS name. Every put is appended to /log/writes.csv as
+# seq,status,start_ms,end_ms, where status is ok or fail.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer-{{ .Member }}
+  labels:
+    app.kubernetes.io/name: twok-bench-writer
+    app.kubernetes.io/part-of: twok
+    twok.aenix.io/writer: "{{ .Member }}"
+spec:
+  restartPolicy: Never
+  enableServiceLinks: false
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  nodeSelector:
+    kubernetes.io/hostname: "{{ .Node }}"
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+{{ .ToolsInit }}
+  containers:
+    - name: writer
+      image: {{ .ShellImage }}
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -u
+          seq=0
+          while :; do
+            seq=$((seq + 1))
+            key=$(printf 'w/%s/%08d' "$MEMBER" "$seq")
+            start=$(date +%s%3N)
+            if /tools/etcdctl --endpoints="http://$MEMBER.etcd:2379" --dial-timeout=1s --command-timeout=1s \
+                put "$key" "$seq" >/dev/null 2>>/log/errors.log; then
+              status=ok
+            else
+              status=fail
+            fi
+            end=$(date +%s%3N)
+            echo "$seq,$status,$start,$end" >>/log/writes.csv
+            sleep 0.2
+          done
+      env:
+        - name: MEMBER
+          value: "{{ .Member }}"
+      resources:
+        requests:
+          cpu: 20m
+          memory: 32Mi
+        limits:
+          memory: 64Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: tools
+          mountPath: /tools
+        - name: log
+          mountPath: /log
+  volumes:
+    - name: tools
+      emptyDir: {}
+    - name: log
+      emptyDir: {}

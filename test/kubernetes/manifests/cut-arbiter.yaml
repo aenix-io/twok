@@ -1,0 +1,27 @@
+# Cuts etcd-1 from the arbiter, whichever overlay provides it: the HTTP
+# arbiter and the EtcdCluster's members carry different labels, both are
+# listed. Traffic to the arbiter's Service is matched too, because the
+# Service address is translated to the backend Pod before the policy applies
+# (kube-proxy replacement). See partition.yaml for the label and the
+# default-deny notes.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: twok-cut-arbiter-etcd-1
+  labels:
+    app.kubernetes.io/name: twok-bench-partition
+    app.kubernetes.io/part-of: twok
+spec:
+  endpointSelector:
+    matchLabels:
+      twok.aenix.io/member: etcd-1
+  enableDefaultDeny:
+    ingress: false
+    egress: false
+  egressDeny:
+    - toEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: twok-arbiter
+    - toEndpoints:
+        - matchLabels:
+            etcd-operator.cozystack.io/cluster: arbiter
