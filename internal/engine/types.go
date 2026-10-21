@@ -95,6 +95,15 @@ func (m *Members) clone() *Members {
 	return c
 }
 
+// WALState is what the member's WAL says, read offline while etcd does
+// not answer.
+type WALState struct {
+	MemberID  uint64
+	ClusterID uint64
+	// Members are the voters and learners the log's configuration holds.
+	Members []uint64
+}
+
 // ArbiterRead is the outcome of one read of the arbiter.
 type ArbiterRead struct {
 	// Err is set when the arbiter could not be read. A missing record is
@@ -150,6 +159,9 @@ type Observation struct {
 	// LearnerStatus is the status of learners the agent could reach, by
 	// member ID.
 	LearnerStatus map[uint64]Status
+	// WAL is the offline inspection of the member's WAL, which the agent
+	// reads while etcd does not answer. It is nil otherwise.
+	WAL *WALState
 	// Arbiter is set when the agent read the arbiter in this poll.
 	Arbiter *ArbiterRead
 	// Result is the outcome of the action executed after the previous
@@ -189,6 +201,10 @@ type Action struct {
 	SurvivorID        uint64
 	ClusterID         uint64
 	PeerURLs          []string
+	// Self is the local member's current ID, from etcd or from its WAL.
+	// The survivor must not list it as a voter; when it lists it as a
+	// learner, the rejoin is already done.
+	Self uint64
 	// Learner is the learner to promote, or for a rejoin the one an
 	// earlier attempt already added, 0 when none is known.
 	Learner uint64

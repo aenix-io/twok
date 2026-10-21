@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -244,6 +245,61 @@ func TestOneWayLinkFailure(t *testing.T) {
 	// one does: Raft needs both directions. The engine sees the same
 	// observations, so the outcome is the same.
 	TestLinkDownBothReachTheArbiter(t)
+}
+
+// The loser's etcd learns that it was removed before the loser's own
+// isolation ever led it to the arbiter: the survivor's messages reach it
+// first. etcd then exits in a loop, and the member must still find out
+// that it is stale and rejoin. Seen on the Kubernetes bench with a one-way
+// cut; here the order is forced with a claim-after the loser never reaches.
+func TestRemovedBeforeTheArbiterWasRead(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("twok restarted %v", restart), func(t *testing.T) {
+			w := newWorld(t)
+			a, b := w.node("a"), w.node("b")
+			slow := testParams()
+			slow.ClaimAfter = time.Hour
+			a.e.SetParams(slow)
+			settle(t, w)
+			w.linkUp = false
+			w.runUntil(60, "b serving alone", func() bool { return b.serving(w) && b.gen == 1 })
+			if w.readsBy["a"] != 1 {
+				t.Fatalf("a read the arbiter %d times, want only at start", w.readsBy["a"])
+			}
+			w.linkUp = true
+			w.step()
+			if !a.removed {
+				t.Fatal("the simulation did not remove a")
+			}
+			if restart {
+				// twok restarts during the crash loop: it never saw the
+				// generation key nor the member list, only the WAL tells
+				// it who it is, and only the configured peer endpoint
+				// where the survivor is.
+				slow.PeerEndpoint = clientURL("b")
+				a.e = New(slow)
+			}
+			expectPairAgain(t, w, 1)
+			if a.count(ActionClaim) != 0 {
+				t.Errorf("a claimed: %v", a.actions)
+			}
+		})
+	}
+}
+
+func TestDownMemberOfTheCurrentGenerationDoesNotRejoin(t *testing.T) {
+	w := newWorld(t)
+	settle(t, w)
+	a := w.node("a")
+	// etcd crash-loops for a reason of its own; nobody took over.
+	a.removed = true
+	w.run(60)
+	if a.count(ActionRejoin) != 0 || a.last.Role != RoleUnknown {
+		t.Errorf("a: %+v, %v", a.last, a.actions)
+	}
+	if r := w.readsBy["a"]; r < 10 || r > 13 {
+		t.Errorf("a read the arbiter %d times in 60s of etcd down, want one per retry delay", r)
+	}
 }
 
 // Further situations.
