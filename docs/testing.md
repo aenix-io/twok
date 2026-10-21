@@ -111,6 +111,8 @@ export K8S_KUBECONFIG=<kubeconfig of the test cluster>   # K8S_NAMESPACE default
 hack/kubernetes-bench.sh TestPartition                   # the baseline, plain etcd
 hack/kubernetes-bench.sh TestPartitionOneWay
 TWOK_IMAGE=ghcr.io/aenix-io/twok:main hack/kubernetes-bench.sh TestPartition   # TWOK_MODE defaults to enforce
+TWOK_IMAGE=... TWOK_OVERLAY=arbiter-etcd hack/kubernetes-bench.sh TestPartition   # or arbiter-kubernetes; default arbiter-http
+TWOK_IMAGE=... hack/kubernetes-bench.sh TestPartitionArbiterCut   # also TestSurvivorRestart
 hack/kubernetes-bench-clean.sh                           # lists what a failed run left; --yes deletes it
 ```
 
@@ -161,11 +163,66 @@ The harness and `hack/kubernetes-bench-clean.sh` now empty each volume from a Po
 
 ## twok results
 
-To be filled when the twok image exists: the same runs with `TWOK_IMAGE` set and each arbiter overlay, plus the arbiter cut (`cut-arbiter.yaml` together with the partition).
-What to record for each run:
+Measured on 2026-10-21 with the twok sidecar built from main at 0588d24 (`ghcr.io/aenix-io/twok:sha-0588d24`, pinned by digest), mode `enforce`, default timings, a 60 s partition and the Cilium policies of the baseline.
+The raw records, with the twok logs of both sidecars, the metrics in the middle of the partition and after the heal, and `twok status` from both members, are in [test/kubernetes/results/twok-2026-10-21.md](../test/kubernetes/results/twok-2026-10-21.md).
+Times are seconds from the moment the partition was applied, on the harness's clock; the agent's log times are on the node's clock, within a few hundred milliseconds of it.
+"Promoted" is the survivor's twok logging `learner promoted`, the moment the pair has two voters again; the harness's own "pair restored" check waits at least 10 s after the heal before it looks, so it is a later, coarser mark and is only in the records.
 
-- the time from the partition to the survivor's first successful put, against the expected 30 s of [design.md](design.md#expected-timeline-with-defaults);
-- which member won, and whether it was the last leader;
-- that the loser accepted no write during the partition;
-- the time from the heal to the pair being restored, against the 48 s the baseline needs only to re-elect;
-- that no acknowledged write was lost.
+### Two-way partition
+
+| Run | Arbiter | Last leader | Survivor | Claim won | First write on the survivor | Promoted after the heal | Acknowledged writes, all present |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | HTTP | etcd-0 | etcd-0 | +26.6 s | +29.5 s | 8.6 s | 455 |
+| 2 | HTTP | etcd-1 | etcd-1 | +26.6 s | +29.2 s | 6.6 s | 436 |
+| 3 | etcd (an `EtcdCluster` of etcd-operator) | etcd-1 | etcd-1 | +26.6 s | +28.9 s | 12.6 s | 476 |
+| 4 | Kubernetes (a ConfigMap in the same API server) | etcd-0 | etcd-0 | +26.0 s | +29.9 s | 9.0 s | 428 |
+
+- The last leader won every run, as the delays intend: it claims 3 s after `claim-after`, the follower 8 s after.
+- The loser accepted no write during the partition in any run, and its claim failed with "the record changed since it was read" 5 to 6 s after the winner's.
+- The first accepted write on the survivor came 29 to 30 s after the cut, as [design.md](design.md#expected-timeline-with-defaults) expects.
+- After the heal the loser rejoined as a learner and was promoted 6.6 to 12.6 s later. The baseline needs 48 s after the heal only to elect a leader again; the rejoin is faster because it restarts the loser's etcd, which opens new peer connections instead of waiting for the old ones to come back.
+- All three arbiter backends behaved the same: the operator's etcd through `etcd://arbiter-client:2379`, and the API server through the Pod's own service account with the Role of `arbiter-kubernetes`.
+
+### Arbiter cut from one member, with the partition
+
+| Run | Leader before the cut | Cut from the arbiter | Survivor | Claim won | First write on the survivor | Promoted after the heal | Acknowledged writes, all present |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 6 | etcd-0 | etcd-1 | etcd-0 | +27.3 s | +30.0 s | 3.3 s | 457 |
+| 7 | etcd-1, moved there with `etcdctl move-leader` | etcd-1 | etcd-0 | +32.1 s | +34.9 s | 3.1 s | 467 |
+
+Run 7 is the one that shows the rule: the leader could not reach the arbiter, so the follower won, after the follower's longer delay (claim at +32.1 s instead of about +27 s).
+Run 6 would have had the same outcome without the arbiter cut.
+
+### Survivor Pod deleted before the loser rejoined
+
+Run 8, HTTP arbiter.
+etcd-0, the last leader, won and took the first write at +30.7 s.
+At +34.3 s its Pod was deleted and the partition removed at once; the StatefulSet's new Pod, on the same volume, was ready at +38.1 s and served as the cluster of one it had been.
+etcd-1 reported the role `stale` throughout, made no claim, and accepted no write.
+It was added as a learner at +57.3 s and promoted at +59.6 s, 25 s after the heal and 21.5 s after the survivor was back; 369 acknowledged writes, all present.
+The survivor was away for only 3.8 s, because the StatefulSet recreates the Pod at once, so this shows the loser waiting for the survivor rather than a long absence.
+
+### One-way partition: failed
+
+Runs 5 and 9, HTTP arbiter, the same result twice.
+etcd-0, the last leader, won at +27.6 s and +26.3 s and took writes from +31.6 s and +30.4 s; etcd-1 accepted no write, and every acknowledged write (1701 and 1728) was present at the end.
+The loser never rejoined: the pair was not restored 5 minutes after the heal.
+
+What happened, from the records of run 9:
+
+1. With the one-way policy, etcd-0's messages still reach etcd-1 over the connections etcd-1 opened. After the takeover, etcd-0 logs `removed member` for etcd-1 and `rejected stream from remote peer because it was removed`.
+2. etcd-1 learns that it was removed and exits, before its own `claim-after` has passed, so its agent never claims and never reads the arbiter's new generation.
+3. The kubelet restarts etcd-1 again and again; it exits each time ("data-dir used by this member must be removed", exit code 1), five restarts and a `BackOff` by the end.
+4. etcd-1's agent logs `etcd does not answer`, role `unknown`, once at +29 s and nothing after; `twok_last_poll_timestamp_seconds` stops there and `twok_poll_failures_total` climbs to 339. It never reads the arbiter, so it never goes to `stale` and never rejoins.
+
+Safety held: no second writer, no lost write.
+Liveness did not: the design says that on any etcd exit twok reads the arbiter, and the agent does not do that while its local etcd does not answer.
+The two-way runs only escaped this by timing: there the loser reached the arbiter during the partition, went `stale` first, and stopped its own etcd for the rejoin before the survivor could tell it that it had been removed.
+
+### How the takeover and the rejoin run under the kubelet
+
+- Stopping etcd with `SIGTERM` took 0.1 to 1.2 s.
+- The WAL edit itself, between "etcd stopped" and "WAL edited", took 8 to 18 ms, for the takeover and for the rejoin.
+- From the WAL edit to etcd answering again took 1.5 to 3 s: the kubelet restarted the container at once.
+- Each takeover and each rejoin counts as one restart of the `etcd` container, with exit code 143 and reason `Error`. In every run the member's first restart came without a delay; the kubelet's exponential backoff starts at the second restart of a container and resets after 10 minutes of running, so a second takeover or rejoin of the same Pod within 10 minutes would wait at least 10 s more. That was not measured on purpose; the only `BackOff` seen was the crash loop of the one-way runs.
+- At start, the agent's arbiter check failed once with "no route to host" while the arbiter's Service had no endpoint yet, and passed a second later; nothing is done until it passes.
