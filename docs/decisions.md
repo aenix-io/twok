@@ -8,7 +8,7 @@ The original idea was a Raft witness: a third voter that stores no data, only te
 
 ## 2. Generations instead of leases
 
-A lease with a TTL is the common arbiter design, but a lease answers "who holds it now", not "whose data is current". A lease expires while the holder still serves, and the other member could take it over with stale data. twok stores a monotonic generation in the arbiter and in each member's state file. A member may claim only the generation its own data belongs to, so stale data disqualifies itself. No clock takes part in a safety decision.
+A lease with a TTL is the common arbiter design, but a lease answers "who holds it now", not "whose data is current". A lease expires while the holder still serves, and the other member could take it over with stale data. twok stores a monotonic generation in the arbiter and in the cluster's own keyspace. A member may claim only the generation its own data belongs to, so stale data disqualifies itself. No clock takes part in a safety decision.
 
 ## 3. Raft fences the loser, not a BMC
 
@@ -22,13 +22,13 @@ Red Hat's two-node OpenShift fences the losing node through its BMC before the s
 
 threek observes etcd through its API and never restarts it. The first twok drafts made twok etcd's parent process, first in its own image with the etcd binary copied in, then inside an image that stands in for etcd, because a takeover seemed to need etcd restarted with `--force-new-cluster` and a rejoin seemed to need a different initial cluster. Both are avoidable: the configuration changes that `--force-new-cluster` writes can be written into the log by twok itself, and a member can keep its log under a new identity instead of being rebuilt. With that, twok needs the same things threek has, plus the data directory and a way to stop the etcd process, and etcd's image and command line stay with the platform. The decision follows threek's final shape on purpose: one mechanism for etcd-operator and Talos, settings changed without restarting etcd, and etcd's security fixes not tied to twok's releases.
 
-## 6. The joining member drives its own rejoin
+## 6. The returning member drives its own rejoin, the survivor promotes
 
-Red Hat's resource agent has the survivor add the learner and promote it. twok lets the returning member do both through the survivor's client API. The survivor's twok then has no state about the peer at all, and a half-finished rejoin is resumed by the member that has the `joining` state file, which is the one that needs it.
+Red Hat's resource agent has the survivor add the learner and promote it. twok lets the returning member ask the survivor to add it and rewrite its own log, because that member is the one that knows its data directory; the survivor's twok only answers the API calls, writes the generation once the learner is up, and promotes the learner when it is caught up. A half-finished rejoin is resumed from what the survivor's member list and the returning member's WAL say, not from a file.
 
 ## 7. Startup does not block on the arbiter
 
-A member whose state file says `member` starts etcd whether or not the arbiter answers. With two voters in its data it cannot commit alone. With one voter in its data it is the survivor, and nobody can have claimed a newer generation without first being promoted into its cluster, which is in its own log. The arbiter is still read at startup when reachable, and a stale member found that way does not start.
+etcd is started by whoever runs it, before twok has looked at anything, and twok never holds it back. With two voters in its data a member cannot commit alone. With one voter in its data it is the survivor, and nobody can have claimed a newer generation without first being promoted into its cluster, which is in its own log. The arbiter is still read at startup when reachable, and a stale member found that way is taken through the rejoin.
 
 ## 8. All transitions go through the arbiter, including rejoin
 

@@ -159,7 +159,7 @@ What the tests must show, with twok running on both members and the arbiter in a
 
 What is guaranteed:
 
-- No two clusters derived from one accept writes at the same time, for any sequence of link, node, site and arbiter failures, as long as the arbiter is a correct compare-and-swap register and nobody edits the arbiter, the state files or the data directories by hand.
+- No two clusters derived from one accept writes at the same time, for any sequence of link, node, site and arbiter failures, as long as the arbiter is a correct compare-and-swap register and nobody edits the arbiter or the data directories by hand.
 - No write acknowledged to a client is lost by a takeover.
 
 What is not guaranteed:
@@ -179,7 +179,7 @@ What is assumed:
 
 - The arbiter backend honours its conditional write exactly as documented. twok checks this once at startup on a probe key next to the record, and refuses the backend if the check fails.
 - Clocks are not relied on for safety. Timers only decide when to try a claim; the claim itself is decided by the arbiter.
-- The state file and the data directory live on the same volume and move together.
+- twok's container sees the same data directory as etcd, on the same volume.
 
 ## Expected timeline with defaults
 
@@ -315,7 +315,7 @@ The agent exits when its loop makes no progress for 30 seconds, so that the plat
 
 ## Testing
 
-- **Unit tests** for the state machine, a pure function of observations and timers: every row of the failure model table, flapping, learners, unknown arbiter state, a stale state file.
+- **Unit tests** for the state machine, a pure function of observations and timers: every row of the failure model table, flapping, learners, unknown arbiter state, a cluster ID mismatch, a lost claim result.
 - **Unit tests** for every arbiter backend against a fake of its store, with the conflict paths exercised.
 - **Integration tests** with real etcd processes and mTLS. Two members talk to each other through TCP proxies that the test can cut, one direction at a time. The arbiter is in memory. The tests assert the failure model table, measure the timeline, and produce the follower's-last-entries situation on purpose.
 - **End-to-end tests** in containers with `iptables` blackholes, as in threek, in CI.

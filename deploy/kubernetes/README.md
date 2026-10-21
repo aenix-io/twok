@@ -24,7 +24,7 @@ For clusters run by etcd-operator, [deploy/twok-agent.yaml](../twok-agent.yaml) 
 ## The member Pod
 
 - The container `etcd` runs the upstream etcd image with a plain etcd command line. Nothing in it knows about twok.
-- The init container `twok` with `restartPolicy: Always` is a native sidecar: it starts before etcd and runs next to it. It runs `twok agent`, talks to etcd on `http://127.0.0.1:2379`, and mounts the same `data` volume at `/var/lib/etcd`, where it keeps its state file and sets the data directory aside on a rejoin.
+- The init container `twok` with `restartPolicy: Always` is a native sidecar: it starts before etcd and runs next to it. It runs `twok agent`, talks to etcd on `http://127.0.0.1:2379`, and mounts the same `data` volume at `/var/lib/etcd`, where it rewrites the WAL on a takeover and on a rejoin while etcd is stopped.
 - `shareProcessNamespace: true` lets the agent find etcd's process and stop it. The kubelet then starts the etcd container again with the same command, and etcd finds what the agent left on the volume. Both containers run as UID 65532, so no capability is needed for the signal.
 - The Pod mirrors etcd-operator's member Pods: the label `etcd-operator.cozystack.io/cluster`, the container `etcd`, the volume `data` (and `tls-client`, `tls-peer` once TLS is on). That keeps one agent for both ways of running it.
 
