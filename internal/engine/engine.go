@@ -109,6 +109,11 @@ type Engine struct {
 	joinedAs uint64
 	joinedAt time.Time
 	learner  uint64
+
+	// touched is the learner for which the survivor wrote the generation
+	// key once more; touching is the one a pending write is for.
+	touched  uint64
+	touching uint64
 }
 
 // New returns an engine that has seen nothing yet.
@@ -215,6 +220,10 @@ func (e *Engine) result(now time.Time, r Result) {
 	case ActionTakeover, ActionWriteGeneration:
 		if r.Err != nil {
 			e.retryAt[r.Action] = now.Add(e.p.RetryDelay)
+			return
+		}
+		if r.Action == ActionWriteGeneration && e.touching != 0 {
+			e.touched, e.touching = e.touching, 0
 		}
 	}
 }
@@ -605,6 +614,19 @@ func (e *Engine) solo(o Observation) Decision {
 	}
 	if st, ok := o.LearnerStatus[learner.ID]; ok && float64(st.AppliedIndex) < float64(o.Local.CommitIndex)*learnerReady {
 		d.Note = "serving alone, learner " + id + " is catching up"
+		return d
+	}
+	if e.touched != learner.ID && o.GenerationKnown {
+		// A member that rejoined from a snapshot serves reads only once it
+		// has applied an entry after it, on etcd 3.6; without reads it
+		// cannot see its own generation. One write gives it that entry.
+		if wait := e.until(o.Now, ActionWriteGeneration); wait > 0 {
+			d.Note, d.Wait = "serving alone, writing the generation for learner "+id+" failed, retrying", wait
+			return d
+		}
+		e.touching = learner.ID
+		d.Action = Action{Kind: ActionWriteGeneration, Generation: o.Generation}
+		d.Note = "serving alone, writing the generation once for learner " + id
 		return d
 	}
 	d.Action = Action{Kind: ActionPromote, Learner: learner.ID}

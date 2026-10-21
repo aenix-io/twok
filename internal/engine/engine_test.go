@@ -304,7 +304,13 @@ func TestLearnerPresentOnTheSurvivor(t *testing.T) {
 	if d := solo(started, map[uint64]Status{0x100: {AppliedIndex: 500}}, nil, 1); d.Action.Kind != ActionNone {
 		t.Fatalf("promoted a learner at half the log: %+v", d)
 	}
+	// Once ready, the survivor first writes the generation once, so that a
+	// learner that came from a snapshot has an entry to apply.
 	d := solo(started, map[uint64]Status{0x100: {AppliedIndex: 950}}, nil, 2)
+	if d.Action.Kind != ActionWriteGeneration || d.Action.Generation != 1 {
+		t.Fatalf("decision = %+v, want the generation written once", d)
+	}
+	d = solo(started, map[uint64]Status{0x100: {AppliedIndex: 950}}, &Result{Action: ActionWriteGeneration}, 2)
 	if d.Action.Kind != ActionPromote || d.Action.Learner != 0x100 {
 		t.Fatalf("decision = %+v, want promote 100", d)
 	}
