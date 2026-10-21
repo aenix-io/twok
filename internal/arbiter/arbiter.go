@@ -101,7 +101,7 @@ var (
 func Register(scheme string, f Factory) {
 	mu.Lock()
 	defer mu.Unlock()
-	if _, dup := factories[scheme]; dup {
+	if registered(scheme) {
 		panic(fmt.Sprintf("arbiter: scheme %q registered twice", scheme))
 	}
 	factories[scheme] = f
@@ -111,8 +111,11 @@ func Register(scheme string, f Factory) {
 func Schemes() []string {
 	mu.RLock()
 	defer mu.RUnlock()
-	schemes := make([]string, 0, len(factories))
+	schemes := make([]string, 0, len(factories)+len(rawFactories))
 	for s := range factories {
+		schemes = append(schemes, s)
+	}
+	for s := range rawFactories {
 		schemes = append(schemes, s)
 	}
 	sort.Strings(schemes)
@@ -121,6 +124,9 @@ func Schemes() []string {
 
 // Open builds the arbiter for a URL from the registered backends.
 func Open(rawURL string) (Arbiter, error) {
+	if f, ok := rawFactory(rawURL); ok {
+		return f(rawURL)
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("arbiter URL: %w", err)
