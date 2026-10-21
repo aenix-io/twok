@@ -16,9 +16,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags "-s -w -X github.com/aenix-io/twok/internal/version.Version=${VERSION}" \
       -o /out/twok ./cmd/twok
 
-# The image holds twok alone. The etcd binary twok supervises is copied next
-# to it at runtime by an init container from the upstream etcd image, so the
-# etcd version stays with whoever deploys it.
+# This image holds twok alone, for `twok run -- etcd ...` with an etcd binary
+# provided some other way, and for the twok arbiter commands. The image that
+# stands in for etcd, with the real etcd inside, is built from
+# Containerfile.etcd.
 FROM ${BASE_IMAGE}
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="twok" \
