@@ -8,7 +8,8 @@ ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
 WORKDIR /src
-COPY go.mod go.sum ./
+# go.sum appears with the first dependency; until then only go.mod exists.
+COPY go.mod go.sum* ./
 RUN go mod download
 COPY cmd cmd
 COPY internal internal
