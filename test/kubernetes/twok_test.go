@@ -272,5 +272,13 @@ func (e *env) twokEvents(member string) {
 		}
 		seen[line.Msg] = true
 		e.mark(ms(at), member+" twok: "+line.Msg)
+		if strings.Contains(line.Msg, "added as a learner") {
+			if e.rejoinAt == nil {
+				e.rejoinAt = map[string]int64{}
+			}
+			if _, ok := e.rejoinAt[member]; !ok {
+				e.rejoinAt[member] = ms(at)
+			}
+		}
 	}
 }

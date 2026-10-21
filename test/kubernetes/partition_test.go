@@ -596,7 +596,7 @@ func (e *env) verify(puts map[string][]put, final map[string]bool, tApply, tHeal
 	sides := 0
 	winner := ""
 	for _, m := range members {
-		var total, ok, missing, during, inFlight int
+		var total, ok, missing, during, inFlight, afterRejoin int
 		for _, p := range puts[m] {
 			total++
 			if !p.ok {
@@ -608,6 +608,10 @@ func (e *env) verify(puts map[string][]put, final map[string]bool, tApply, tHeal
 				e.t.Errorf("writer-%s: put %d returned success at %d and is missing from the final cluster", m, p.seq, p.end)
 			}
 			switch {
+			case p.start >= from && p.start < tHeal && e.rejoinAt[m] != 0 && p.start >= e.rejoinAt[m]:
+				// The member rejoined the survivor's cluster while the
+				// partition lasted, which a one-way cut allows: one cluster.
+				afterRejoin++
 			case p.start >= from && p.start < tHeal:
 				during++
 			case p.start >= tApply && p.start < from:
@@ -619,8 +623,9 @@ func (e *env) verify(puts map[string][]put, final map[string]bool, tApply, tHeal
 			winner = m
 		}
 		e.logf("writer-%s: %d puts, %d successful, %d successful puts missing after the heal, "+
-			"%d successful puts started in the first %s of the partition, %d started later in the partition",
-			m, total, ok, missing, inFlight, settle, during)
+			"%d successful puts started in the first %s of the partition, %d started later in the partition, "+
+			"%d more during the partition after the member rejoined the survivor's cluster",
+			m, total, ok, missing, inFlight, settle, during, afterRejoin)
 		if cfg.baseline() && during > 0 {
 			e.t.Errorf("writer-%s: %d puts succeeded during the partition; plain etcd with two voters must accept none", m, during)
 		}
