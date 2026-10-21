@@ -88,11 +88,11 @@ stateDiagram-v2
 - If the arbiter cannot be reached, nothing happens, and the member stays isolated. etcd stays up and refuses writes on its own.
 - If a leader comes back at any point, the member returns to **Pair**.
 
-**Solo.** The member won. twok stops etcd, appends to the member's log the configuration changes that remove every other member, with the commit index at the end of the log (see [The whole log counts](#the-whole-log-counts)), and lets etcd start again with its usual flags. etcd replays the log, applies the changes, and leads a cluster of one within a couple of seconds. twok then writes `/twok/generation` with the new generation. It does not renew anything in the arbiter: a cluster of one keeps its quorum until a second voter is added, and only twok adds one.
+**Solo.** The member won. twok stops etcd, appends to the member's log the configuration changes that remove every other member, with the commit index at the end of the log (see [The whole log counts](#the-whole-log-counts)), and lets etcd start again with its usual flags. The WAL edit takes the WAL's file lock as soon as etcd has exited; when the platform has started etcd again before that, twok stops it again and retries, a bounded number of times. etcd replays the log, applies the changes, and leads a cluster of one within a couple of seconds. twok then writes `/twok/generation` with the new generation. It does not renew anything in the arbiter: a cluster of one keeps its quorum until a second voter is added, and only twok adds one.
 
-**Stale.** The member lost. Its etcd keeps running: it cannot commit, and it serves serializable reads from data that is now behind. When it reaches the survivor's peer port it is told it was removed (HTTP 410 on the peer stream) and exits, with exit code 0 and no marker on disk; whoever runs etcd restarts it, and it exits again. twok does not parse that. It waits until the survivor's client API answers and goes to **Joining**.
+**Stale.** The member lost. Its etcd keeps running: it cannot commit, and it serves serializable reads from data that is now behind. When it reaches the survivor's peer port it is told it was removed (HTTP 410 on the peer stream) and exits, with exit code 0 and no marker on disk; whoever runs etcd restarts it, and it exits again. twok does not parse that. It waits until the survivor's client API answers and goes to **Joining**. Every rejoin attempt starts from a fresh read of the arbiter, and goes ahead only if the arbiter's generation is still ahead of the local one and names another member; the survivor's client URL comes from the last member list the member saw, or from `--peer-endpoint`. The survivor is joined only when it answers with the cluster ID and the member ID the record names, leads, and is the only voter.
 
-**Joining.** twok asks the survivor to add the local member as a learner, under a new member ID, with the local peer URLs. It then stops the local etcd, rewrites the member's log so that it belongs to the new ID, and lets etcd start again with its usual flags. The member keeps its data: it reconnects to the survivor, receives the entries it missed, applies the removal of its old ID and its own addition as a learner, and catches up from where it was. When the learner is caught up, the survivor's twok promotes it. When the local member reports that it is a voter, it is back in **Pair**.
+**Joining.** twok asks the survivor to add the local member as a learner, under a new member ID, with the local peer URLs. It then stops the local etcd, rewrites the member's log so that it belongs to the new ID, and lets etcd start again with its usual flags. The member keeps its data: it reconnects to the survivor, receives the entries it missed, applies the removal of its old ID and its own addition as a learner, and catches up from where it was. The log is rewritten only after the survivor's member list shows the learner with the local peer URLs. When the learner is caught up, the survivor's twok writes `/twok/generation` once more, so that a learner that came from a snapshot has a new entry to apply (etcd 3.6 serves reads on such a member only after one), and then promotes it. The previous WAL, which the rewrite keeps to undo it, is removed once the member is a voter in a pair again. When the local member reports that it is a voter, it is back in **Pair**. An attempt that added the learner and failed before the log was rewritten is resumed with the same learner, found by its peer URLs in the survivor's member list.
 
 This rejoin, keeping the log and changing only the member's identity, rested on an experiment rather than on etcd's documented behaviour. The experiment is positive on etcd 3.5.34 and 3.6.15, for a member that is a few entries behind, for one that needs a snapshot, and for one that holds a diverged tail of its own; the numbers are in [testing.md](testing.md). The fallback, had it failed, was the rejoin Red Hat does, which discards the data directory and needs the member restarted with a different initial cluster.
 
@@ -215,12 +215,17 @@ Two etcd bugs matter for the takeover and the rejoin, and both are avoided or fi
 | `claim-after` | `20s` | how long the cluster must be without a leader before a claim is considered |
 | `claim-delay` | `3s` | extra wait before the claim for the member that was the last leader |
 | `follower-extra-delay` | `5s` | extra wait on top of `claim-delay` for a member that was not the last leader |
-| `mode` | `off` | `off`: observe and log only. `dry-run`: decide and log, never act. `enforce`: act. |
+| `mode` | `off` | `off`: observe and log only, the arbiter is not contacted. `dry-run`: decide and log, never act; the arbiter is read, never written. `enforce`: act. |
 | `metrics-listen` | empty | address for Prometheus metrics |
+| `peer-endpoint` | empty | client URL of the other member, used for a rejoin when the last member list the member saw does not name the survivor's |
+| `config-dir` | empty | directory of the mounted ConfigMap with the shared settings |
 
 The TLS files for the client API are flags as in threek: `--cert-file`, `--key-file`, `--trusted-ca-file`.
+twok edits the WAL in `<data-dir>/member/wal`; a member run with `--wal-dir` elsewhere is not supported.
 The member's name, peer URLs and the rest of its configuration twok reads from the etcd process itself: it runs in the same PID namespace and reads etcd's command line from `/proc`.
-As in threek, the settings shared by the members can come from a mounted ConfigMap that is read again before every poll, so `mode` is switched without restarting anything.
+As in threek, the settings shared by the members can come from a mounted ConfigMap that is read again before every poll, so `mode` is switched without restarting anything. The shared settings are `mode`, `poll-interval`, `claim-after`, `claim-delay` and `follower-extra-delay`, one file each. A missing directory or a missing `mode` key means `off`; an invalid file keeps the previous configuration. The same settings are also flags, which win over the ConfigMap, and every flag falls back to an environment variable `TWOK_<FLAG>`, such as `TWOK_ARBITER`.
+
+Without access to the etcd process (no shared PID namespace, or no etcd process with the configured `--data-dir`), twok logs an error and takes no action that stops etcd. It does not claim either: a claim that cannot be followed by a takeover would leave nobody serving.
 
 ## Arbiter backends
 
@@ -255,7 +260,7 @@ The `http` contract is small enough for a Cloudflare Worker with a Durable Objec
 
 ## Manual intervention
 
-`twok arbiter get` prints the record. `twok arbiter claim --survivor <name>` moves the generation forward by hand, for the double failure above: the operator declares a member the survivor, accepts that writes after the last common point are lost, and twok on that member does the takeover at the next poll. The command refuses to run without an explicit `--accept-data-loss`.
+`twok arbiter get` prints the record. `twok arbiter claim --survivor <name>` moves the generation forward by hand, for the double failure above: the operator declares a member the survivor, accepts that writes after the last common point are lost, and twok on that member does the takeover at the next poll. A manual claim may jump more than one generation ahead of the named member's data, so the named member finishes it from any older generation, which it does not do for an automatic claim. The command refuses to run without an explicit `--accept-data-loss`.
 
 An administrator who runs `--force-new-cluster` by hand must also claim the generation, or the other member will not know whom to follow.
 
@@ -293,12 +298,20 @@ Every transition is logged with its reason and the generation.
 | Metric | Meaning |
 | --- | --- |
 | `twok_generation` | the local generation |
-| `twok_role{role}` | 1 for the current role: pair, isolated, solo, stale, joining |
+| `twok_role{role}` | 1 for the current role: pair, isolated, solo, stale, joining, or unknown while etcd does not answer and nothing earlier says what the member is |
 | `twok_leader_seen` | 1 when the last poll reported a leader |
 | `twok_arbiter_reachable` | 1 when the last arbiter read succeeded |
 | `twok_claims_total{result}` | claims attempted, by result: won, lost, error |
 | `twok_rejoins_total{result}` | rejoins, by result |
 | `twok_last_poll_timestamp_seconds` | Unix time of the last successful poll |
+| `twok_actions_total{action,result}` | actions executed, by action and result: success, error; dry-run decisions counted once each |
+| `twok_mode{mode}` | 1 for the current mode |
+| `twok_config_valid` | 0 while the ConfigMap is invalid and the previous configuration is kept |
+| `twok_arbiter_verified` | 1 once the arbiter passed its conditional-write check; no action is taken before |
+| `twok_process_controlled` | 1 once twok has found the etcd process |
+| `twok_poll_failures_total` | polls in which the local member did not answer |
+
+The agent exits when its loop makes no progress for 30 seconds, so that the platform restarts it; the waits of a takeover and a rejoin count as progress.
 
 ## Testing
 
