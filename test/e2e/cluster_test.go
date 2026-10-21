@@ -841,6 +841,8 @@ func (c *cluster) agentEvents(m *member) {
 				text += fmt.Sprintf(" (action %v)", a)
 			}
 			c.tl.add(at, "%s", text)
+		case msg == "decision" && line["dryRun"] == true:
+			c.tl.add(at, "%s twok: dry-run, would %v: %v", m.name, line["action"], line["note"])
 		case msg == "decision":
 		case strings.Contains(msg, "metrics"), strings.Contains(msg, "arbiter honours"):
 		default:
