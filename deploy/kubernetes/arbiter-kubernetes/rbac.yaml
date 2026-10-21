@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: twok
+  labels:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/part-of: twok
+---
+# create cannot be limited by resourceNames, so it is a rule of its own on all
+# ConfigMaps of the namespace; get and update are limited to the record.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: twok-arbiter
+  labels:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/part-of: twok
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    resourceNames:
+      - twok-arbiter
+      - twok-arbiter.probe
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: twok-arbiter
+  labels:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/part-of: twok
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: twok-arbiter
+subjects:
+  - kind: ServiceAccount
+    name: twok

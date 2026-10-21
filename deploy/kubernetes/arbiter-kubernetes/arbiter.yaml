@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd
+spec:
+  template:
+    spec:
+      serviceAccountName: twok
+      automountServiceAccountToken: true
+      containers:
+        - name: etcd
+          env:
+            - name: TWOK_ARBITER
+              value: kubernetes://$(NAMESPACE)/twok-arbiter

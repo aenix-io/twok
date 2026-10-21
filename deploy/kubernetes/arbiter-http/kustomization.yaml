@@ -1,0 +1,14 @@
+# twok with the reference HTTP arbiter, `twok arbiter serve`, as a Deployment
+# in the same namespace.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+  - arbiter.yaml
+patches:
+  - path: members.yaml
+# The one place where the arbiter image is set.
+images:
+  - name: twok
+    newName: ghcr.io/aenix-io/twok
+    newTag: main

@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd
+  labels:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/part-of: twok
+spec:
+  serviceName: etcd
+  replicas: 2
+  # Both members must start together: the first one waits for the second to
+  # form the initial two-voter cluster.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: etcd
+      app.kubernetes.io/part-of: twok
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: etcd
+        app.kubernetes.io/part-of: twok
+    spec:
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: etcd
+                  app.kubernetes.io/part-of: twok
+      containers:
+        - name: etcd
+          # twok-etcd is the upstream etcd image with twok installed as
+          # /usr/local/bin/etcd and the real etcd next to it. The reference is
+          # resolved by the images entry in kustomization.yaml.
+          image: twok-etcd
+          # A plain etcd command line. twok takes its own settings from the
+          # TWOK_* variables below; the same settings can be given as
+          # --twok-* flags in this list, and a flag wins over the variable.
+          # With the upstream etcd image instead of twok-etcd the variables
+          # are ignored and the Pod runs plain etcd.
+          command:
+            - /usr/local/bin/etcd
+          args:
+            - --name=$(POD_NAME)
+            - --data-dir=/var/lib/etcd/data
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://$(POD_NAME).etcd:2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --initial-advertise-peer-urls=http://$(POD_NAME).etcd:2380
+            - --listen-metrics-urls=http://0.0.0.0:2381
+            - --initial-cluster=etcd-0=http://etcd-0.etcd:2380,etcd-1=http://etcd-1.etcd:2380
+            - --initial-cluster-state=new
+            - --initial-cluster-token=$(NAMESPACE)-etcd
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Set by the arbiter overlay. It is an env entry and not a
+            # ConfigMap key so that it can refer to $(NAMESPACE).
+            - name: TWOK_ARBITER
+              value: set-by-an-arbiter-overlay
+          envFrom:
+            - configMapRef:
+                name: twok
+          ports:
+            - name: client
+              containerPort: 2379
+            - name: peer
+              containerPort: 2380
+            - name: etcd-metrics
+              containerPort: 2381
+            - name: twok-metrics
+              containerPort: 2390
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: etcd-metrics
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/etcd
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

@@ -1,0 +1,17 @@
+# twok settings, read by twok from the environment. A --twok-* flag on the
+# command line wins over the variable. The arbiter URL is set by the overlay
+# in the StatefulSet's env, see statefulset.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: twok
+  labels:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/part-of: twok
+data:
+  TWOK_POLL_INTERVAL: 1s
+  TWOK_CLAIM_AFTER: 20s
+  TWOK_CLAIM_DELAY: 3s
+  TWOK_FOLLOWER_EXTRA_DELAY: 5s
+  TWOK_COMMIT_TAIL: "true"
+  TWOK_METRICS_LISTEN: :2390
