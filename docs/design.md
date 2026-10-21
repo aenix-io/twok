@@ -94,7 +94,7 @@ stateDiagram-v2
 
 **Joining.** twok asks the survivor to add the local member as a learner, under a new member ID, with the local peer URLs. It then stops the local etcd, rewrites the member's log so that it belongs to the new ID, and lets etcd start again with its usual flags. The member keeps its data: it reconnects to the survivor, receives the entries it missed, applies the removal of its old ID and its own addition as a learner, and catches up from where it was. When the learner is caught up, the survivor's twok promotes it. When the local member reports that it is a voter, it is back in **Pair**.
 
-This rejoin, keeping the log and changing only the member's identity, is the one part of the design that rests on an experiment rather than on etcd's documented behaviour; see [Open questions](#open-questions). If it does not hold, the fallback is the rejoin Red Hat does, which discards the data directory and needs the member restarted with a different initial cluster, and so needs whoever runs etcd to cooperate.
+This rejoin, keeping the log and changing only the member's identity, rested on an experiment rather than on etcd's documented behaviour. The experiment is positive on etcd 3.5.34 and 3.6.15, for a member that is a few entries behind, for one that needs a snapshot, and for one that holds a diverged tail of its own; the numbers are in [testing.md](testing.md). The fallback, had it failed, was the rejoin Red Hat does, which discards the data directory and needs the member restarted with a different initial cluster.
 
 The survivor's twok takes no part in the rejoin beyond answering the API calls and promoting the learner. It returns to **Pair** when its member list shows two voters again.
 
@@ -128,11 +128,13 @@ The property to prove: at any time, at most one etcd cluster derived from the or
 
 A follower acknowledges an entry to the leader as soon as it is in its log. The leader commits it, answers the client, and tells the follower about the new commit index in its next message to it. If the partition hits in between, the follower holds an acknowledged entry that it does not know is committed, and it never learns. etcd's `--force-new-cluster` discards entries after the member's commit index, so a follower that becomes the survivor that way would lose it. Two details make the window wider than a heartbeat: the leader's notification is one message, lost with the partition, and the commit index alone is written to the WAL without a sync, so even a notification that arrived may not be on disk when the follower is killed. The fix in etcd 3.5.22 and 3.6.1, which keeps entries up to the applied index, does not cover this case: a follower cannot apply what it does not know is committed. The sources are in the research notes under [docs/research/](research/).
 
-twok does not use `--force-new-cluster`. It writes the same configuration changes into the log itself, after the last entry, and sets the commit index at the end. Nothing is truncated. This is safe in a two-voter cluster and only there:
+twok does not use `--force-new-cluster`. It writes the same configuration changes into the log itself, after the last entry, and sets the commit index at the end. Nothing is truncated. The test bench reproduced the loss: with the follower killed right after an acknowledged write, `--force-new-cluster` on it lost between one and four acknowledged entries in every run on both etcd versions, and twok's operation lost none; see [testing.md](testing.md). This is safe in a two-voter cluster and only there:
 
 - Every committed entry is in both logs, because a commit needs both acknowledgements.
 - No entry in either log was ever contradicted by a committed entry at the same index, because contradicting it would have required that member's acknowledgement, and the acknowledgement overwrites the entry.
 - So the survivor's log is a prefix-consistent superset of the committed log. Treating all of it as committed commits some proposals that had timed out for their clients. A timed-out request is allowed to take effect; that is the contract every etcd client already lives with.
+
+The appended entries carry the next term, with a vote for the survivor itself, as if it had won an election alone. etcd's `--force-new-cluster` appends in the current term, and that is not safe for a loser that keeps its log: the loser may hold entries of its own in the current term at the same indexes, Raft matches logs by index and term, and the loser would keep its entries and later fail on a membership it never applied. The experiment shows exactly that failure for the current-term variant. No leader can exist in the next term without the survivor's vote, so no entry anywhere carries it, and the loser's tail is overwritten when it catches up.
 
 The last leader is still preferred as the survivor through `follower-extra-delay`, so that in the common case no such entries exist at all.
 
@@ -324,6 +326,5 @@ Every transition is logged with its reason and the generation.
 
 ## Open questions
 
-1. Whether a member can rejoin by keeping its log under a new member ID, as described in **Joining**. The experiment and its result are in [testing.md](testing.md); until it is positive on both supported etcd versions, the rejoin is the open end of the design.
-2. Whether `claim-after` should scale with the election timeout, or stay a wall-clock setting as Red Hat's fencing delay is.
-3. How twok stops etcd on Talos without privileges beyond the etcd user, and whether Talos's own etcd health checks tolerate the restart.
+1. Whether `claim-after` should scale with the election timeout, or stay a wall-clock setting as Red Hat's fencing delay is.
+2. How twok stops etcd on Talos without privileges beyond the etcd user, and whether Talos's own etcd health checks tolerate the restart.
