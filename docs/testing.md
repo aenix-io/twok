@@ -3,6 +3,50 @@
 What was measured, how, and with which result.
 The design states what the tests must show in [design.md](design.md#failure-model); this file records what they did show.
 
+## WAL operations on real etcd
+
+The takeover and the rejoin are offline operations on a stopped member's WAL, in `internal/walops`.
+Their tests run against real etcd processes, on etcd v3.5.34 and v3.6.15, with `go test -race ./internal/walops/` and `TEST_ETCD_BINARY` set; the whole package takes about four minutes per version.
+
+### Acknowledged writes survive the takeover
+
+`TestStandaloneKeepsAcknowledgedWrites`: a pair of members; a client writes keys through the leader and records every acknowledged key; the follower is killed with `SIGKILL` right after an acknowledgement; its WAL is inspected; then the follower is made a cluster of one, either with twok's `Standalone` and a restart with its usual flags, or, as the control, with etcd's own `--force-new-cluster` on a copy of the same data directory.
+Three modes, three runs each, per etcd version:
+
+| Mode | Persisted commit behind the last index | By how many entries | Lost with `Standalone` | Lost with `--force-new-cluster` |
+| --- | --- | --- | --- | --- |
+| immediate: killed right after the acknowledgement | 6 of 6 runs | 1 | 0 | 1 acknowledged entry, 6 of 6 runs |
+| quiet: killed one second after the last write | 6 of 6 runs | 1 | 0 | 0 |
+| concurrent: four writers, killed at a random moment | 6 of 6 runs | 2 to 4 | 0 | 1 to 4 acknowledged entries, 6 of 6 runs |
+
+The quiet mode shows that the persisted commit index stays behind even after a second of silence: the commit-only hard state sits in etcd's write buffer.
+The control loses nothing in that mode only because 3.5.34 and 3.6.15 take the larger of the commit index and the backend's consistent index, and the backend has been synced by then; 3.5.12, the version the operator runs today, does not do that.
+
+After `Standalone` and a normal restart the member leads a cluster of one in 1.1 to 2.0 s, and its member list shows one member.
+The other member, started with its usual flags, exits on its own as soon as it reaches the survivor: "the member has been permanently removed from the cluster".
+A second `Standalone` on the same WAL changes nothing, byte for byte.
+
+### Rejoin under a new member ID
+
+`TestRejoinWithNewID`: the survivor runs `Standalone`, adds the other member as a learner under a new ID, the other member's WAL is rewritten with `Reidentify`, and it is started with its usual flags, data directory in place.
+On both versions:
+
+| Case | Result |
+| --- | --- |
+| incremental: a few entries behind | the member receives the missing entries, applies the removal of its old ID and its addition as a learner, becomes a learner, is promoted; 210 keys on both |
+| snapshot: 5300 entries behind with `--snapshot-count=100` | the same through a snapshot; 5411 keys on both |
+| divergent: the loser was the leader and holds 10 entries of its own below the cut | its tail is overwritten; none of its keys exists on either member |
+| control: removals appended in the current term, as `--force-new-cluster` does | the loser fails with `panic: failed to update; member unknown` on both versions |
+
+Until the removal of the old ID is applied, the rejoining member logs "failed to find remote peer in cluster": its old identity dials its own URL.
+On 3.6.15 a member that caught up through a snapshot does not publish itself or serve reads until it applies one new entry, with thousands of "failed to publish ... too many requests" lines meanwhile; the control that rejoins from a wiped data directory behaves the same, so this is etcd's behaviour, and one write to the cluster ends it.
+
+### Other checks
+
+- `Standalone` and `Reidentify` refuse a WAL that a running etcd holds locked; `Inspect` reads it.
+- With `--snapshot-count=10 --max-wals=2` the first WAL segment is gone; the operations open the WAL at the newest snapshot and the last key survives the restart.
+- A promotion right after `AddLearner` fails with "learner not ready" and succeeds after two or three retries.
+
 ## Kubernetes test bench
 
 A two-member etcd on a real Kubernetes cluster, partitioned with Cilium network policies.

@@ -48,7 +48,11 @@ A member needs to know which generation its data belongs to, so that it never cl
 
 ## 12. Rejoin by keeping the log under a new member ID
 
-Red Hat's rejoin discards the loser's data directory and starts it as a fresh learner, which copies the whole store and needs a different initial cluster on the next start. twok instead rewrites the loser's WAL so that it belongs to the new member ID the survivor assigned, and lets etcd start with its old flags: Raft's log matching lets the member catch up from where it was, and the removal of its old identity and its addition as a learner arrive as ordinary entries. This is the one part of the design that rests on an experiment rather than on documented behaviour; it is recorded here before the result is in, so that the result can be read against it.
+Red Hat's rejoin discards the loser's data directory and starts it as a fresh learner, which copies the whole store and needs a different initial cluster on the next start. twok instead rewrites the loser's WAL so that it belongs to the new member ID the survivor assigned, and lets etcd start with its old flags: Raft's log matching lets the member catch up from where it was, and the removal of its old identity and its addition as a learner arrive as ordinary entries. This was recorded before the experiment ran. The experiment is positive on etcd 3.5.34 and 3.6.15, including a member that needs a snapshot and one with a diverged tail of its own; see [testing.md](testing.md).
+
+## 14. The survivor's new entries carry the next term
+
+etcd's `--force-new-cluster` appends its removals in the current term. twok appends them in the next term, with a vote for the survivor itself. The reason is the loser's own tail: a loser that was the leader may hold uncommitted entries of the current term at the same indexes, and Raft treats an entry with the same index and term as the same entry, so the loser would keep its own and never apply the removal; the experiment shows it failing with "member unknown" in that case. Nobody can have been elected in the next term without the survivor's vote, which it persists before giving, so no entry anywhere carries that term and the loser's tail is overwritten when it catches up.
 
 ## 13. Talos by design, etcd-operator without changes
 
