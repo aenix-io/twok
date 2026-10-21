@@ -15,6 +15,7 @@ require (
 	go.etcd.io/etcd/server/v3 v3.6.15
 	go.etcd.io/raft/v3 v3.6.0
 	go.uber.org/zap v1.28.0
+	google.golang.org/grpc v1.83.2
 )
 
 require (
@@ -50,6 +51,5 @@ require (
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/grpc v1.83.2 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
