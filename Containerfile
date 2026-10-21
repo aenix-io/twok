@@ -16,14 +16,12 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags "-s -w -X github.com/aenix-io/twok/internal/version.Version=${VERSION}" \
       -o /out/twok ./cmd/twok
 
-# This image holds twok alone, for `twok run -- etcd ...` with an etcd binary
-# provided some other way, and for the twok arbiter commands. The image that
-# stands in for etcd, with the real etcd inside, is built from
-# Containerfile.etcd.
+# The image holds twok alone. twok runs next to etcd, as a sidecar container
+# or a static Pod, and learns etcd's configuration from its command line.
 FROM ${BASE_IMAGE}
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="twok" \
-      org.opencontainers.image.description="twok runs etcd on two members and breaks the tie through an external arbiter" \
+      org.opencontainers.image.description="twok arbiter agent, run next to etcd to break the tie between two members" \
       org.opencontainers.image.source="https://github.com/aenix-io/twok" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}"
