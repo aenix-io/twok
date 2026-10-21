@@ -1,0 +1,143 @@
+# Injects the twok agent as a native sidecar into etcd-operator member Pods
+# labeled twok.aenix.io/inject=true. Set the label through the cluster's
+# spec.additionalMetadata.labels. Requires Kubernetes 1.36 or later. On 1.35,
+# enable the MutatingAdmissionPolicy feature gate and the
+# admissionregistration.k8s.io/v1beta1 API, and apply this file with
+# apiVersion admissionregistration.k8s.io/v1beta1.
+#
+# The sidecar mounts the member's data volume and shares the Pod's process
+# namespace with etcd, so that it can stop etcd for a takeover or a rejoin;
+# the kubelet then starts etcd again with the operator's command. It runs as
+# the Pod's user, which etcd-operator sets to 65532 for every container.
+#
+# The agent reads its settings, the arbiter URL included, from the ConfigMap
+# <cluster>-twok in the Pod's namespace, and must stay passive while that
+# ConfigMap does not exist.
+#
+# Not a supported way to run twok yet: etcd-operator still promotes learners
+# and reports two members as degraded, see docs/etcd-operator.md. This file is
+# for testing the sidecar inside operator Pods, in CI on kind with Kubernetes
+# 1.36, as threek tests its policy.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: twok-agent
+spec:
+  # A policy error must never stop an etcd member from being created: the
+  # member then starts without the agent. This does not cover the agent image:
+  # a native sidecar starts before etcd, so etcd waits for that image too.
+  failurePolicy: Ignore
+  reinvocationPolicy: Never
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    objectSelector:
+      matchExpressions:
+        - key: twok.aenix.io/inject
+          operator: In
+          values: ["true"]
+        - key: etcd-operator.cozystack.io/cluster
+          operator: Exists
+  matchConditions:
+    - name: etcd-member
+      expression: object.spec.containers.exists(c, c.name == "etcd")
+    - name: not-injected
+      expression: >-
+        !has(object.spec.initContainers) ||
+        !object.spec.initContainers.exists(c, c.name == "twok")
+  variables:
+    - name: image
+      expression: '"ghcr.io/aenix-io/twok:main"'
+    - name: cluster
+      expression: object.metadata.labels["etcd-operator.cozystack.io/cluster"]
+    # Volume names and mount paths follow etcd-operator's member Pods. They
+    # are not part of the operator's API.
+    - name: clientTLS
+      expression: has(object.spec.volumes) && object.spec.volumes.exists(v, v.name == "tls-client")
+    - name: peerTLS
+      expression: has(object.spec.volumes) && object.spec.volumes.exists(v, v.name == "tls-peer")
+    # etcd's own --data-dir, which may be a subdirectory of the volume.
+    - name: etcdArgs
+      expression: >-
+        object.spec.containers.filter(c, c.name == "etcd").map(c,
+          (has(c.command) ? c.command : []) + (has(c.args) ? c.args : []))[0]
+    - name: dataDir
+      expression: >-
+        variables.etcdArgs.exists(a, a.startsWith("--data-dir="))
+        ? variables.etcdArgs.filter(a, a.startsWith("--data-dir="))[0].substring(11)
+        : "/var/lib/etcd"
+    # The agent's flags; the same names as in deploy/kubernetes/base.
+    - name: args
+      expression: >-
+        [
+          "--endpoint=" + (variables.clientTLS ? "https" : "http") + "://127.0.0.1:2379",
+          "--data-dir=" + variables.dataDir,
+          "--config-dir=/etc/twok",
+          "--metrics-listen=:2390",
+        ] +
+        (variables.clientTLS ? [
+          "--cert-file=/etc/etcd/tls/client/tls.crt",
+          "--key-file=/etc/etcd/tls/client/tls.key",
+          "--trusted-ca-file=/etc/etcd/tls/client/ca.crt",
+        ] : [])
+  mutations:
+    # JSONPatch rather than ApplyConfiguration: an apply configuration may not
+    # set atomic fields such as args.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          (has(object.spec.initContainers) ? [] : [JSONPatch{op: "add", path: "/spec/initContainers", value: []}]) +
+          (has(object.spec.volumes) ? [] : [JSONPatch{op: "add", path: "/spec/volumes", value: []}]) +
+          [
+            JSONPatch{op: "add", path: "/spec/shareProcessNamespace", value: true},
+            JSONPatch{
+              op: "add",
+              path: "/spec/initContainers/-",
+              value:
+                Object.spec.initContainers{
+                  name: "twok",
+                  image: variables.image,
+                  restartPolicy: "Always",
+                  command: ["twok-agent"],
+                  args: variables.args,
+                  ports: [Object.spec.initContainers.ports{name: "twok-metrics", containerPort: 2390}],
+                  volumeMounts:
+                    [
+                      Object.spec.initContainers.volumeMounts{name: "data", mountPath: "/var/lib/etcd"},
+                      Object.spec.initContainers.volumeMounts{name: "twok-config", mountPath: "/etc/twok", readOnly: true}
+                    ] +
+                    (variables.clientTLS ? [Object.spec.initContainers.volumeMounts{name: "tls-client", mountPath: "/etc/etcd/tls/client", readOnly: true}] : []) +
+                    (variables.peerTLS ? [Object.spec.initContainers.volumeMounts{name: "tls-peer", mountPath: "/etc/etcd/tls/peer", readOnly: true}] : []),
+                  // Requests equal to limits keep a Guaranteed member Guaranteed.
+                  resources: Object.spec.initContainers.resources{
+                    requests: {"cpu": "50m", "memory": "64Mi"},
+                    limits: {"cpu": "50m", "memory": "64Mi"}
+                  },
+                  securityContext: Object.spec.initContainers.securityContext{
+                    allowPrivilegeEscalation: false,
+                    readOnlyRootFilesystem: true,
+                    runAsNonRoot: true,
+                    seccompProfile: Object.spec.initContainers.securityContext.seccompProfile{type: "RuntimeDefault"},
+                    capabilities: Object.spec.initContainers.securityContext.capabilities{drop: ["ALL"]}
+                  }
+                }
+            },
+            JSONPatch{
+              op: "add",
+              path: "/spec/volumes/-",
+              value: Object.spec.volumes{
+                name: "twok-config",
+                configMap: Object.spec.volumes.configMap{name: variables.cluster + "-twok", optional: true}
+              }
+            }
+          ]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: twok-agent
+spec:
+  policyName: twok-agent
