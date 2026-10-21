@@ -1,0 +1,2 @@
+# One sentence per line keeps diffs readable; lines are not wrapped.
+MD013: false

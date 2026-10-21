@@ -1,0 +1,36 @@
+version: "2"
+
+run:
+  build-tags:
+    - e2e
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nolintlint
+    - revive
+    - unparam
+    - usestdlibvars
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Tests start helper processes and write temporary files on purpose.
+      - path: (_test\.go|internal/etcdtest/)
+        linters:
+          - gosec
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/aenix-io/twok
