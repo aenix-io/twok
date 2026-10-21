@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -14,7 +15,6 @@ import (
 	"go.etcd.io/etcd/server/v3/storage/wal/walpb"
 	"go.etcd.io/raft/v3/raftpb"
 	"go.uber.org/zap/zaptest"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/aenix-io/twok/internal/walops"
 )
@@ -35,22 +35,23 @@ type save struct {
 
 func confChange(t *testing.T, typ raftpb.ConfChangeType, id uint64) []byte {
 	t.Helper()
-	b, err := proto.Marshal(&raftpb.ConfChange{Type: new(typ), NodeId: new(id)})
+	cc := raftpb.ConfChange{Type: typ, NodeID: id}
+	b, err := cc.Marshal()
 	if err != nil {
 		t.Fatal(err)
 	}
 	return b
 }
 
-func entry(t *testing.T, term, index uint64) *raftpb.Entry {
+func entry(t *testing.T, term, index uint64) raftpb.Entry {
 	t.Helper()
 	switch index {
 	case 1:
-		return &raftpb.Entry{Term: new(term), Index: new(index), Type: new(raftpb.EntryConfChange), Data: confChange(t, raftpb.ConfChangeAddNode, memberA)}
+		return raftpb.Entry{Term: term, Index: index, Type: raftpb.EntryConfChange, Data: confChange(t, raftpb.ConfChangeAddNode, memberA)}
 	case 2:
-		return &raftpb.Entry{Term: new(term), Index: new(index), Type: new(raftpb.EntryConfChange), Data: confChange(t, raftpb.ConfChangeAddNode, memberB)}
+		return raftpb.Entry{Term: term, Index: index, Type: raftpb.EntryConfChange, Data: confChange(t, raftpb.ConfChangeAddNode, memberB)}
 	default:
-		return &raftpb.Entry{Term: new(term), Index: new(index), Data: []byte("x")}
+		return raftpb.Entry{Term: term, Index: index, Data: []byte("x")}
 	}
 }
 
@@ -59,7 +60,8 @@ func entry(t *testing.T, term, index uint64) *raftpb.Entry {
 func writeWAL(t *testing.T, saves ...save) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "wal")
-	meta, err := proto.Marshal(&pb.Metadata{NodeID: new(uint64(memberA)), ClusterID: new(uint64(clusterID))})
+	md := pb.Metadata{NodeID: memberA, ClusterID: clusterID}
+	meta, err := md.Marshal()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,11 +70,11 @@ func writeWAL(t *testing.T, saves ...save) string {
 		t.Fatal(err)
 	}
 	for _, s := range saves {
-		var ents []*raftpb.Entry
+		var ents []raftpb.Entry
 		for i := s.from; s.from != 0 && i <= s.to; i++ {
 			ents = append(ents, entry(t, s.term, i))
 		}
-		hs := &raftpb.HardState{Term: new(s.term), Vote: new(s.vote), Commit: new(s.commit)}
+		hs := raftpb.HardState{Term: s.term, Vote: s.vote, Commit: s.commit}
 		if err := w.Save(hs, ents); err != nil {
 			t.Fatal(err)
 		}
@@ -84,9 +86,9 @@ func writeWAL(t *testing.T, saves ...save) string {
 }
 
 // readWAL returns the metadata, the hard state and the entries.
-func readWAL(t *testing.T, dir string) (*pb.Metadata, *raftpb.HardState, []*raftpb.Entry) {
+func readWAL(t *testing.T, dir string) (pb.Metadata, raftpb.HardState, []raftpb.Entry) {
 	t.Helper()
-	w, err := wal.OpenForRead(zaptest.NewLogger(t), dir, &walpb.Snapshot{})
+	w, err := wal.OpenForRead(zaptest.NewLogger(t), dir, walpb.Snapshot{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,17 +97,17 @@ func readWAL(t *testing.T, dir string) (*pb.Metadata, *raftpb.HardState, []*raft
 	if err != nil {
 		t.Fatal(err)
 	}
-	meta := &pb.Metadata{}
-	if err := proto.Unmarshal(metadata, meta); err != nil {
+	var meta pb.Metadata
+	if err := meta.Unmarshal(metadata); err != nil {
 		t.Fatal(err)
 	}
 	return meta, st, ents
 }
 
-func indexes(ents []*raftpb.Entry) []uint64 {
+func indexes(ents []raftpb.Entry) []uint64 {
 	var idx []uint64
 	for _, e := range ents {
-		idx = append(idx, e.GetIndex())
+		idx = append(idx, e.Index)
 	}
 	return idx
 }
@@ -155,10 +157,10 @@ func TestStandalone(t *testing.T) {
 			}
 
 			meta, hs, ents := readWAL(t, dir)
-			if meta.GetNodeID() != memberA || meta.GetClusterID() != clusterID {
+			if meta.NodeID != memberA || meta.ClusterID != clusterID {
 				t.Fatalf("metadata changed: %v", meta)
 			}
-			if hs.GetTerm() != hsBefore.GetTerm()+1 || hs.GetVote() != memberA || hs.GetCommit() != tt.wantLast+1 || res.Term != hs.GetTerm() {
+			if hs.Term != hsBefore.Term+1 || hs.Vote != memberA || hs.Commit != tt.wantLast+1 || res.Term != hs.Term {
 				t.Fatalf("hard state %v, was %v", hs, hsBefore)
 			}
 			// Every entry is kept, and one removal follows them.
@@ -167,12 +169,12 @@ func TestStandalone(t *testing.T) {
 			}
 			last := ents[len(ents)-1]
 			var cc raftpb.ConfChange
-			if err := proto.Unmarshal(last.GetData(), &cc); err != nil {
+			if err := cc.Unmarshal(last.Data); err != nil {
 				t.Fatal(err)
 			}
-			if last.GetType() != raftpb.EntryConfChange || last.GetTerm() != hsBefore.GetTerm()+1 || last.GetIndex() != tt.wantLast+1 ||
-				cc.GetType() != raftpb.ConfChangeRemoveNode || cc.GetNodeId() != memberB || len(cc.GetContext()) != 0 {
-				t.Fatalf("appended entry %v, conf change %v", last, &cc)
+			if last.Type != raftpb.EntryConfChange || last.Term != hsBefore.Term+1 || last.Index != tt.wantLast+1 ||
+				cc.Type != raftpb.ConfChangeRemoveNode || cc.NodeID != memberB || len(cc.Context) != 0 {
+				t.Fatalf("appended entry %v, conf change %v", last, cc)
 			}
 
 			st, err := walops.Inspect(zaptest.NewLogger(t), dir)
@@ -236,7 +238,7 @@ func TestStandaloneRefuses(t *testing.T) {
 func TestRefusesLockedWAL(t *testing.T) {
 	dir := writeWAL(t, save{1, 3, 1, 1, 2})
 	// An open WAL holds the same locks a running etcd holds.
-	w, err := wal.Open(zaptest.NewLogger(t), dir, &walpb.Snapshot{})
+	w, err := wal.Open(zaptest.NewLogger(t), dir, walpb.Snapshot{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +291,7 @@ func TestRepairsTornTail(t *testing.T) {
 	if _, err := os.Stat(segment + ".broken"); err != nil {
 		t.Fatalf("no copy of the torn segment: %v", err)
 	}
-	if _, hs, ents := readWAL(t, dir); hs.GetCommit() != 6 || !slices.Equal(indexes(ents), []uint64{1, 2, 3, 4, 5, 6}) {
+	if _, hs, ents := readWAL(t, dir); hs.Commit != 6 || !slices.Equal(indexes(ents), []uint64{1, 2, 3, 4, 5, 6}) {
 		t.Fatalf("after repair: %v, %v", hs, indexes(ents))
 	}
 }
@@ -306,23 +308,18 @@ func TestReidentify(t *testing.T) {
 		t.Fatalf("Reidentify = %+v", st)
 	}
 	meta, hs, ents := readWAL(t, dir)
-	if meta.GetNodeID() != 0xd || meta.GetClusterID() != clusterID {
+	if meta.NodeID != 0xd || meta.ClusterID != clusterID {
 		t.Fatalf("metadata %v", meta)
 	}
-	if !proto.Equal(hs, hsBefore) {
+	if !reflect.DeepEqual(hs, hsBefore) {
 		t.Fatalf("hard state %v, was %v", hs, hsBefore)
 	}
-	if len(ents) != len(entsBefore) {
-		t.Fatalf("%d entries, were %d", len(ents), len(entsBefore))
-	}
-	for i := range ents {
-		if !proto.Equal(ents[i], entsBefore[i]) {
-			t.Fatalf("entry %d is %v, was %v", i, ents[i], entsBefore[i])
-		}
+	if !reflect.DeepEqual(ents, entsBefore) {
+		t.Fatalf("entries %v, were %v", ents, entsBefore)
 	}
 
 	// The old WAL is kept until Cleanup, and blocks a second run.
-	if meta, _, _ := readWAL(t, walops.OldWALDir(dir)); meta.GetNodeID() != memberA {
+	if meta, _, _ := readWAL(t, walops.OldWALDir(dir)); meta.NodeID != memberA {
 		t.Fatalf("old WAL metadata %v", meta)
 	}
 	if _, err := walops.Reidentify(zaptest.NewLogger(t), dir, 0xe); err == nil {

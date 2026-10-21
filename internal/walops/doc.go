@@ -46,7 +46,7 @@
 //
 // The WAL format is the same in etcd 3.5, 3.6 and 3.7, and newer releases
 // read older data directories for the in-place upgrade. This package is built
-// with the WAL package of etcd 3.7 and reads and writes data directories of
+// with the WAL package of etcd 3.6 and reads and writes data directories of
 // 3.5 and 3.6 members: it writes only metadata, snapshot, entry and hard state
 // records, whose encoding has not changed since etcd 3.0, and conf change
 // entries in the v1 format that etcd itself writes.

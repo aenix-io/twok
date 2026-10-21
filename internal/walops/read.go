@@ -14,7 +14,6 @@ import (
 	"go.etcd.io/etcd/server/v3/storage/wal/walpb"
 	"go.etcd.io/raft/v3/raftpb"
 	"go.uber.org/zap"
-	"google.golang.org/protobuf/proto"
 )
 
 // ErrLocked is returned when another process, normally etcd, holds the WAL.
@@ -82,10 +81,10 @@ func Inspect(lg *zap.Logger, walDir string) (State, error) {
 
 // walLog is a WAL read to the end.
 type walLog struct {
-	snap  *walpb.Snapshot
-	meta  *pb.Metadata
-	hs    *raftpb.HardState
-	ents  []*raftpb.Entry
+	snap  walpb.Snapshot
+	meta  pb.Metadata
+	hs    raftpb.HardState
+	ents  []raftpb.Entry
 	state State
 }
 
@@ -128,27 +127,27 @@ func tryOpenForWrite(lg *zap.Logger, walDir string) (*wal.WAL, walLog, error) {
 	return w, l, nil
 }
 
-func readAll(w *wal.WAL, walDir string, snap *walpb.Snapshot) (walLog, error) {
+func readAll(w *wal.WAL, walDir string, snap walpb.Snapshot) (walLog, error) {
 	metadata, hs, ents, err := w.ReadAll()
 	if err != nil {
 		return walLog{}, fmt.Errorf("read WAL %s: %w", walDir, err)
 	}
-	meta := &pb.Metadata{}
-	if err := proto.Unmarshal(metadata, meta); err != nil {
+	var meta pb.Metadata
+	if err := meta.Unmarshal(metadata); err != nil {
 		return walLog{}, fmt.Errorf("WAL %s metadata: %w", walDir, err)
 	}
 	l := walLog{snap: snap, meta: meta, hs: hs, ents: ents}
 	l.state = State{
-		MemberID:      meta.GetNodeID(),
-		ClusterID:     meta.GetClusterID(),
-		SnapshotIndex: snap.GetIndex(),
-		LastIndex:     snap.GetIndex(),
-		Term:          hs.GetTerm(),
-		Vote:          hs.GetVote(),
-		Commit:        hs.GetCommit(),
+		MemberID:      meta.NodeID,
+		ClusterID:     meta.ClusterID,
+		SnapshotIndex: snap.Index,
+		LastIndex:     snap.Index,
+		Term:          hs.Term,
+		Vote:          hs.Vote,
+		Commit:        hs.Commit,
 	}
 	if len(ents) > 0 {
-		l.state.LastIndex = ents[len(ents)-1].GetIndex()
+		l.state.LastIndex = ents[len(ents)-1].Index
 	}
 	// raft refuses to start with a commit index beyond its log. Such a WAL
 	// is damaged, and none of the operations here can fix it.
@@ -165,14 +164,16 @@ func readAll(w *wal.WAL, walDir string, snap *walpb.Snapshot) (walLog, error) {
 
 // membership replays the conf changes after snap on its ConfState. etcd
 // writes only v1 conf changes; v2 ones are read for completeness.
-func membership(snap *walpb.Snapshot, ents []*raftpb.Entry) ([]uint64, error) {
-	cs := snap.GetConfState()
-	if cs == nil && snap.GetIndex() > 0 {
+func membership(snap walpb.Snapshot, ents []raftpb.Entry) ([]uint64, error) {
+	cs := snap.ConfState
+	if cs == nil && snap.Index > 0 {
 		return nil, nil
 	}
 	ids := map[uint64]bool{}
-	for _, id := range slices.Concat(cs.GetVoters(), cs.GetLearners()) {
-		ids[id] = true
+	if cs != nil {
+		for _, id := range slices.Concat(cs.Voters, cs.Learners) {
+			ids[id] = true
+		}
 	}
 	apply := func(typ raftpb.ConfChangeType, id uint64) {
 		switch typ {
@@ -184,20 +185,20 @@ func membership(snap *walpb.Snapshot, ents []*raftpb.Entry) ([]uint64, error) {
 		}
 	}
 	for _, e := range ents {
-		switch e.GetType() {
+		switch e.Type {
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
-			if err := proto.Unmarshal(e.GetData(), &cc); err != nil {
-				return nil, fmt.Errorf("conf change at index %d: %w", e.GetIndex(), err)
+			if err := cc.Unmarshal(e.Data); err != nil {
+				return nil, fmt.Errorf("conf change at index %d: %w", e.Index, err)
 			}
-			apply(cc.GetType(), cc.GetNodeId())
+			apply(cc.Type, cc.NodeID)
 		case raftpb.EntryConfChangeV2:
 			var cc raftpb.ConfChangeV2
-			if err := proto.Unmarshal(e.GetData(), &cc); err != nil {
-				return nil, fmt.Errorf("conf change at index %d: %w", e.GetIndex(), err)
+			if err := cc.Unmarshal(e.Data); err != nil {
+				return nil, fmt.Errorf("conf change at index %d: %w", e.Index, err)
 			}
-			for _, c := range cc.GetChanges() {
-				apply(c.GetType(), c.GetNodeId())
+			for _, c := range cc.Changes {
+				apply(c.Type, c.NodeID)
 			}
 		case raftpb.EntryNormal:
 		}
@@ -214,16 +215,16 @@ func membership(snap *walpb.Snapshot, ents []*raftpb.Entry) ([]uint64, error) {
 // accept to start from: one at or below the WAL's commit index. etcd purges
 // old WAL segments, so the record written when the WAL was created, at
 // index 0, is often gone.
-func newestSnapshot(lg *zap.Logger, walDir string) (*walpb.Snapshot, error) {
+func newestSnapshot(lg *zap.Logger, walDir string) (walpb.Snapshot, error) {
 	if !wal.Exist(walDir) {
-		return nil, fmt.Errorf("no WAL in %s: %w", walDir, os.ErrNotExist)
+		return walpb.Snapshot{}, fmt.Errorf("no WAL in %s: %w", walDir, os.ErrNotExist)
 	}
 	snaps, err := wal.ValidSnapshotEntries(lg, walDir)
 	if err != nil {
-		return nil, fmt.Errorf("find snapshot records in WAL %s: %w", walDir, err)
+		return walpb.Snapshot{}, fmt.Errorf("find snapshot records in WAL %s: %w", walDir, err)
 	}
 	if len(snaps) == 0 {
-		return nil, fmt.Errorf("WAL %s holds no valid snapshot record", walDir)
+		return walpb.Snapshot{}, fmt.Errorf("WAL %s holds no valid snapshot record", walDir)
 	}
 	return snaps[len(snaps)-1], nil
 }

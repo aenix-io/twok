@@ -11,7 +11,6 @@ import (
 	"go.etcd.io/etcd/server/v3/storage/wal"
 	"go.etcd.io/raft/v3/raftpb"
 	"go.uber.org/zap"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -93,7 +92,8 @@ func writeWAL(lg *zap.Logger, dir string, newID uint64, l walLog) error {
 	if err := os.RemoveAll(dir); err != nil {
 		return err
 	}
-	metadata, err := proto.Marshal(&pb.Metadata{NodeID: new(newID), ClusterID: new(l.meta.GetClusterID())})
+	meta := pb.Metadata{NodeID: newID, ClusterID: l.meta.ClusterID}
+	metadata, err := meta.Marshal()
 	if err != nil {
 		return err
 	}
@@ -106,20 +106,19 @@ func writeWAL(lg *zap.Logger, dir string, newID uint64, l walLog) error {
 		_ = w.Close()
 		return fmt.Errorf("write WAL %s: %w", dir, err)
 	}
-	if l.snap.GetIndex() > 0 {
+	if l.snap.Index > 0 {
 		if err := w.SaveSnapshot(l.snap); err != nil {
 			return fail(err)
 		}
 	}
 	for ents := l.ents; len(ents) > 0; {
 		n := min(len(ents), saveBatch)
-		if err := w.Save(nil, ents[:n]); err != nil {
+		if err := w.Save(raftpb.HardState{}, ents[:n]); err != nil {
 			return fail(err)
 		}
 		ents = ents[n:]
 	}
-	hs := &raftpb.HardState{Term: new(l.hs.GetTerm()), Vote: new(l.hs.GetVote()), Commit: new(l.hs.GetCommit())}
-	if err := w.Save(hs, nil); err != nil {
+	if err := w.Save(l.hs, nil); err != nil {
 		return fail(err)
 	}
 	if err := w.Sync(); err != nil {

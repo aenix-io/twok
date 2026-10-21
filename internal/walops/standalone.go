@@ -6,7 +6,6 @@ import (
 
 	"go.etcd.io/raft/v3/raftpb"
 	"go.uber.org/zap"
-	"google.golang.org/protobuf/proto"
 )
 
 // StandaloneResult reports what Standalone found and did.
@@ -95,28 +94,26 @@ func standalone(lg *zap.Logger, walDir string, self uint64, remove []uint64, sam
 	if sameTerm {
 		term, vote = l.state.Term, l.state.Vote
 	}
-	ents := make([]*raftpb.Entry, 0, len(toRemove))
+	ents := make([]raftpb.Entry, 0, len(toRemove))
 	next := l.state.LastIndex + 1
 	for _, id := range toRemove {
 		// The same entry etcd's createConfigChangeEnts builds for a
 		// removal: a v1 conf change with the node ID and nothing else.
-		data, err := proto.Marshal(&raftpb.ConfChange{
-			Type:   new(raftpb.ConfChangeRemoveNode),
-			NodeId: new(id),
-		})
+		cc := raftpb.ConfChange{Type: raftpb.ConfChangeRemoveNode, NodeID: id}
+		data, err := cc.Marshal()
 		if err != nil {
 			return fail(err)
 		}
-		ents = append(ents, &raftpb.Entry{
-			Type:  new(raftpb.EntryConfChange),
-			Term:  new(term),
-			Index: new(next),
+		ents = append(ents, raftpb.Entry{
+			Type:  raftpb.EntryConfChange,
+			Term:  term,
+			Index: next,
 			Data:  data,
 		})
 		next++
 	}
 	last := next - 1
-	hs := &raftpb.HardState{Term: new(term), Vote: new(vote), Commit: new(last)}
+	hs := raftpb.HardState{Term: term, Vote: vote, Commit: last}
 	if err := w.Save(hs, ents); err != nil {
 		return fail(fmt.Errorf("append to WAL %s: %w", walDir, err))
 	}
