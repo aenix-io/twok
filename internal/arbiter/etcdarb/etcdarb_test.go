@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -128,16 +127,28 @@ func TestParseURL(t *testing.T) {
 		{raw: "etcd://e1:2379/", errContain: "no key"},
 		{raw: "etcd://e1,,e2/k", errContain: "empty endpoint"},
 		{raw: "etcd://e1:99999/k", errContain: "invalid port"},
+		{raw: "etcd://e1:2379,e2/k", endpoints: []string{"http://e1:2379", "http://e2:2379"}, key: "/k"},
+		{raw: "etcd://[::1]:2379,[fd00::2]/a/b.c", endpoints: []string{"http://[::1]:2379", "http://[fd00::2]:2379"}, key: "/a/b.c"},
+		{raw: "ETCD://e1/k", endpoints: []string{"http://e1:2379"}, key: "/k"},
+		{raw: "etcd://e1/k%20x", endpoints: []string{"http://e1:2379"}, key: "/k%20x"},
 		{raw: "etcd://e1:2379/k?timeout=1s", errContain: "no query"},
-		{raw: "etcds://e1/k", errContain: "scheme"},
+		{raw: "etcd://e1/k#frag", errContain: "no query"},
+		{raw: "etcd://e1/k x", errContain: "space"},
+		{raw: "etcds://e1/k", errContain: "URL must be"},
+		{raw: "etcd:e1/k", errContain: "URL must be"},
+		{raw: "etcd://::1/k", errContain: "in brackets"},
+		{raw: "etcd://[::1/k", errContain: "unclosed bracket"},
+		{raw: "etcd://[10.0.0.1]/k", errContain: "IPv6"},
+		{raw: "etcd://[::1]x/k", errContain: "after the bracketed"},
+		{raw: "etcd://e1:/k", errContain: "invalid port"},
+		{raw: "etcd://e1:+80/k", errContain: "invalid port"},
+		{raw: "etcd://e1:0/k", errContain: "invalid port"},
+		{raw: "etcd://e_1.example..com/k", errContain: "not a host name"},
+		{raw: "etcd://e1%2f/k", errContain: "not a host name"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.raw, func(t *testing.T) {
-			u, err := url.Parse(tt.raw)
-			if err != nil {
-				t.Fatal(err)
-			}
-			endpoints, key, err := parseURL(u)
+			_, endpoints, key, err := parseURL(tt.raw)
 			if tt.errContain != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.errContain) {
 					t.Fatalf("parseURL(%q) err = %v, want one containing %q", tt.raw, err, tt.errContain)
@@ -151,6 +162,18 @@ func TestParseURL(t *testing.T) {
 				t.Fatalf("parseURL(%q) = %q, %q, %v; want %q, %q", tt.raw, endpoints, key, err, tt.endpoints, tt.key)
 			}
 		})
+	}
+}
+
+// TestOpenHostList goes through the registry: a host list must reach the
+// backend whatever net/url thinks of it, on every Go release.
+func TestOpenHostList(t *testing.T) {
+	for _, raw := range []string{"etcd://e1,e2:2380,10.0.0.3:2379/k", "etcd+tls://e1:2379,e2:2379/twok/prod"} {
+		a, err := arbiter.Open(raw)
+		if err != nil {
+			t.Fatalf("Open(%q): %v", raw, err)
+		}
+		_ = a.(*Arbiter).Close()
 	}
 }
 

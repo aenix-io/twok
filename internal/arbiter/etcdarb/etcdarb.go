@@ -8,17 +8,19 @@
 //	etcd://host1:2379,host2:2379/twok/prod      plaintext
 //	etcd+tls://host1:2379,host2:2379/twok/prod  TLS
 //
-// The host part is a comma-separated list of endpoints; the port defaults
-// to 2379, but Go's URL parser rejects a list whose last endpoint has no
-// port while an earlier one has, so give every port or none. IPv6
-// addresses are not supported in the list. The path, leading slash
-// included, is the key.
+// Between the scheme and the first slash is a comma-separated list of
+// endpoints, each host, host:port, [ipv6] or [ipv6]:port, with port 2379
+// when none is given. The rest, leading slash included, is the key, taken
+// literally: no percent-decoding, no query, no fragment. The backend
+// parses the URL itself, registered through arbiter.RegisterRaw, because
+// net/url does not accept a host list, and how it fails on one differs
+// between Go releases.
 //
 // With etcd+tls the server is verified against TWOK_ETCD_ARBITER_CA, or
 // the system roots when it is not set, and TWOK_ETCD_ARBITER_CERT and
-// TWOK_ETCD_ARBITER_KEY give a client certificate. Setting any of them with etcd:// is an error
-// rather than a silent upgrade or downgrade. etcd user names and passwords
-// are not supported; use client certificates.
+// TWOK_ETCD_ARBITER_KEY give a client certificate. Setting any of them
+// with etcd:// is an error rather than a silent upgrade or downgrade. etcd
+// user names and passwords are not supported; use client certificates.
 //
 // The version is the key's mod revision as a decimal string. A key that
 // does not exist has version Zero. CompareAndSwap is a single transaction:
@@ -37,9 +39,9 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -75,8 +77,8 @@ const (
 )
 
 func init() {
-	arbiter.Register(Scheme, New)
-	arbiter.Register(SchemeTLS, New)
+	arbiter.RegisterRaw(Scheme, New)
+	arbiter.RegisterRaw(SchemeTLS, New)
 }
 
 // Arbiter is the etcd backend. It is safe for concurrent use.
@@ -92,12 +94,12 @@ var _ arbiter.Arbiter = (*Arbiter)(nil)
 // New builds the backend from an etcd:// or etcd+tls:// URL. It does not
 // connect: the client dials on the first request, so that a member can
 // start while the arbiter is unreachable, as decision 7 requires.
-func New(u *url.URL) (arbiter.Arbiter, error) {
-	endpoints, key, err := parseURL(u)
+func New(rawURL string) (arbiter.Arbiter, error) {
+	scheme, endpoints, key, err := parseURL(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	tlsConfig, err := tlsFromEnv(u.Scheme == SchemeTLS)
+	tlsConfig, err := tlsFromEnv(scheme == SchemeTLS)
 	if err != nil {
 		return nil, err
 	}
@@ -117,46 +119,105 @@ func New(u *url.URL) (arbiter.Arbiter, error) {
 	return &Arbiter{client: client, kv: client.KV, key: key, endpoints: endpoints}, nil
 }
 
-func parseURL(u *url.URL) (endpoints []string, key string, err error) {
-	const form = "etcd://host:2379,host2:2379/key/path or etcd+tls://..."
-	if u.Scheme != Scheme && u.Scheme != SchemeTLS {
-		return nil, "", fmt.Errorf("etcd arbiter: scheme %q, want %q or %q", u.Scheme, Scheme, SchemeTLS)
+const form = "etcd://host:2379,host2:2379/key/path or etcd+tls://..."
+
+// parseURL splits an etcd URL into its scheme, its endpoints as client
+// URLs, and its key, without net/url.
+func parseURL(rawURL string) (scheme string, endpoints []string, key string, err error) {
+	scheme, rest, ok := strings.Cut(rawURL, "://")
+	scheme = strings.ToLower(scheme)
+	if !ok || (scheme != Scheme && scheme != SchemeTLS) {
+		return "", nil, "", fmt.Errorf("etcd arbiter: URL must be %s", form)
 	}
+	if strings.ContainsAny(rest, "?#") {
+		return "", nil, "", fmt.Errorf("etcd arbiter: URL must have no query or fragment (URL form %s)", form)
+	}
+	for _, r := range rest {
+		if r <= ' ' || r == 0x7f {
+			return "", nil, "", fmt.Errorf("etcd arbiter: URL has a space or control character (URL form %s)", form)
+		}
+	}
+	hosts, path, _ := strings.Cut(rest, "/")
+	key = "/" + path
 	switch {
-	case u.User != nil:
-		return nil, "", fmt.Errorf("etcd arbiter: credentials in the URL are not accepted; use client certificates through %s and %s (URL form %s)", CertEnv, KeyEnv, form)
-	case u.Opaque != "":
-		return nil, "", fmt.Errorf("etcd arbiter: URL must be %s", form)
-	case u.RawQuery != "" || u.Fragment != "":
-		return nil, "", fmt.Errorf("etcd arbiter: URL must have no query or fragment (URL form %s)", form)
-	case u.Host == "":
-		return nil, "", fmt.Errorf("etcd arbiter: no endpoints in the URL (URL form %s)", form)
-	case u.Path == "" || u.Path == "/":
-		return nil, "", fmt.Errorf("etcd arbiter: no key in the URL (URL form %s)", form)
+	case strings.Contains(hosts, "@"):
+		return "", nil, "", fmt.Errorf("etcd arbiter: credentials in the URL are not accepted; use client certificates through %s and %s (URL form %s)", CertEnv, KeyEnv, form)
+	case hosts == "":
+		return "", nil, "", fmt.Errorf("etcd arbiter: no endpoints in the URL (URL form %s)", form)
+	case path == "":
+		return "", nil, "", fmt.Errorf("etcd arbiter: no key in the URL (URL form %s)", form)
 	}
 	httpScheme := "http://"
-	if u.Scheme == SchemeTLS {
+	if scheme == SchemeTLS {
 		httpScheme = "https://"
 	}
-	for ep := range strings.SplitSeq(u.Host, ",") {
-		if ep == "" {
-			return nil, "", fmt.Errorf("etcd arbiter: empty endpoint in %q (URL form %s)", u.Host, form)
+	for ep := range strings.SplitSeq(hosts, ",") {
+		hostPort, err := parseEndpoint(ep)
+		if err != nil {
+			return "", nil, "", fmt.Errorf("etcd arbiter: endpoint %q: %w (URL form %s)", ep, err, form)
 		}
-		host, port := ep, defaultPort
-		if h, p, err := net.SplitHostPort(ep); err == nil {
-			host, port = h, p
-		} else if strings.ContainsAny(ep, ":[]") {
-			return nil, "", fmt.Errorf("etcd arbiter: endpoint %q is not host or host:port (URL form %s)", ep, form)
-		}
-		if host == "" {
-			return nil, "", fmt.Errorf("etcd arbiter: endpoint %q has no host (URL form %s)", ep, form)
-		}
-		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
-			return nil, "", fmt.Errorf("etcd arbiter: endpoint %q has an invalid port (URL form %s)", ep, form)
-		}
-		endpoints = append(endpoints, httpScheme+net.JoinHostPort(host, port))
+		endpoints = append(endpoints, httpScheme+hostPort)
 	}
-	return endpoints, u.Path, nil
+	return scheme, endpoints, key, nil
+}
+
+// parseEndpoint validates host, host:port, [ipv6] or [ipv6]:port and
+// returns it as host:port with the default port filled in.
+func parseEndpoint(ep string) (string, error) {
+	if ep == "" {
+		return "", errors.New("empty endpoint")
+	}
+	host, port := ep, defaultPort
+	if strings.HasPrefix(ep, "[") {
+		end := strings.Index(ep, "]")
+		if end < 0 {
+			return "", errors.New("unclosed bracket")
+		}
+		host = ep[1:end]
+		switch after := ep[end+1:]; {
+		case after == "":
+		case strings.HasPrefix(after, ":"):
+			port = after[1:]
+		default:
+			return "", errors.New("unexpected text after the bracketed address")
+		}
+		if ip := net.ParseIP(host); ip == nil || ip.To4() != nil {
+			return "", errors.New("brackets must hold an IPv6 address")
+		}
+	} else {
+		if strings.Count(ep, ":") > 1 {
+			return "", errors.New("an IPv6 address must be in brackets")
+		}
+		if h, p, ok := strings.Cut(ep, ":"); ok {
+			host, port = h, p
+		}
+		if !validHostname(host) {
+			return "", errors.New("not a host name or IPv4 address")
+		}
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || port != strconv.Itoa(n) {
+		return "", fmt.Errorf("invalid port %q", port)
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// validHostname accepts DNS names and IPv4 addresses: letters, digits,
+// hyphens and underscores in dot-separated labels.
+func validHostname(h string) bool {
+	if h == "" || len(h) > 253 {
+		return false
+	}
+	for label := range strings.SplitSeq(h, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func tlsFromEnv(useTLS bool) (*tls.Config, error) {
