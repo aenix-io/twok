@@ -8,8 +8,8 @@
 // K8S_KUBECONFIG; everything is created in K8S_NAMESPACE (default
 // twok-test) and deleted at the end unless K8S_KEEP is set. Without
 // TWOK_IMAGE the members run plain upstream etcd, which is the baseline;
-// with it every member has the twok sidecar from that image, and the HTTP
-// arbiter runs from the same image.
+// with it every member has the twok sidecar from that image, with the
+// arbiter of the overlay in TWOK_OVERLAY (default arbiter-http).
 package kubernetes
 
 import (
@@ -47,6 +47,7 @@ type config struct {
 	namespace       string
 	twokImage       string
 	twokMode        string
+	overlay         string
 	ciliumNamespace string
 	partitionFor    time.Duration
 	healFor         time.Duration
@@ -63,6 +64,7 @@ func TestMain(m *testing.M) {
 		namespace:       envOr("K8S_NAMESPACE", "twok-test"),
 		twokImage:       os.Getenv("TWOK_IMAGE"),
 		twokMode:        envOr("TWOK_MODE", "enforce"),
+		overlay:         envOr("TWOK_OVERLAY", "arbiter-http"),
 		ciliumNamespace: envOr("K8S_CILIUM_NAMESPACE", "cozy-cilium"),
 		partitionFor:    durationEnv("TWOK_PARTITION_FOR", 60*time.Second),
 		healFor:         durationEnv("TWOK_HEAL_FOR", 10*time.Second),
@@ -105,12 +107,35 @@ func (c config) mode() string {
 	if c.baseline() {
 		return "baseline (upstream etcd, no arbiter)"
 	}
-	return "twok " + c.twokImage + " as a sidecar in mode " + c.twokMode + ", HTTP arbiter from the same image"
+	return "twok " + c.twokImage + " as a sidecar in mode " + c.twokMode + ", overlay " + c.overlay + ", arbiter " + c.arbiterURL()
+}
+
+// arbiterURL is the arbiter URL the overlay gives the members.
+func (c config) arbiterURL() string {
+	switch c.overlay {
+	case "arbiter-etcd":
+		return "etcd://arbiter-client:2379/twok/etcd"
+	case "arbiter-kubernetes":
+		return "kubernetes://" + c.namespace + "/twok-arbiter"
+	default:
+		return "http://arbiter:8080/twok/etcd"
+	}
 }
 
 type env struct {
-	t   *testing.T
-	log *bytes.Buffer // the raw record of the run, for TWOK_RESULTS
+	t      *testing.T
+	log    *bytes.Buffer // the raw record of the run, for TWOK_RESULTS
+	events []event       // extra timeline entries
+}
+
+type event struct {
+	at   int64 // Unix ms on the local clock
+	what string
+}
+
+// mark adds an entry to the timeline.
+func (e *env) mark(at int64, what string) {
+	e.events = append(e.events, event{at, what})
 }
 
 func (e *env) logf(format string, args ...any) {
@@ -191,13 +216,13 @@ func (e *env) deleteFile(path string) {
 }
 
 // membersManifest renders the member manifests: the baseline without the
-// sidecar, or the arbiter-http overlay with TWOK_IMAGE for the sidecar and
-// the arbiter, and TWOK_MODE in the ConfigMap.
+// sidecar, or the TWOK_OVERLAY overlay with TWOK_IMAGE for the sidecar and
+// the HTTP arbiter, and TWOK_MODE in the ConfigMap.
 func (e *env) membersManifest() string {
 	e.t.Helper()
 	dir := "manifests/baseline"
 	if !cfg.baseline() {
-		dir = "../../deploy/kubernetes/arbiter-http"
+		dir = "../../deploy/kubernetes/" + cfg.overlay
 	}
 	out, err := exec.Command("kubectl", "kustomize", dir).Output()
 	if err != nil {

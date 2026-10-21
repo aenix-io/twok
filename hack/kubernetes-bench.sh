@@ -2,7 +2,7 @@
 # Runs the Kubernetes partition bench of test/kubernetes against a real
 # cluster and keeps the raw record under test/kubernetes/results/.
 #
-#   K8S_KUBECONFIG=/path/to/kubeconfig hack/kubernetes-bench.sh [TestPartition|TestPartitionOneWay]
+#   K8S_KUBECONFIG=/path/to/kubeconfig hack/kubernetes-bench.sh [TestPartition|TestPartitionOneWay|TestPartitionArbiterCut|TestSurvivorRestart]
 #
 # Environment:
 #   K8S_KUBECONFIG        kubeconfig of the cluster (required)
@@ -10,6 +10,8 @@
 #   TWOK_IMAGE            twok image for the sidecar and the HTTP arbiter;
 #                         unset runs the plain etcd baseline without a sidecar
 #   TWOK_MODE             the agent's mode in a twok run (default enforce)
+#   TWOK_OVERLAY          arbiter overlay of deploy/kubernetes for a twok run
+#                         (default arbiter-http; arbiter-etcd, arbiter-kubernetes)
 #   TWOK_PARTITION_FOR    how long the partition lasts (default 60s)
 #   TWOK_HEAL_FOR         how long to watch at least after the heal (default 10s)
 #   TWOK_HEAL_TIMEOUT     how long to wait at most for the pair to recover (default 5m)
