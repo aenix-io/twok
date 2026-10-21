@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aenix-io/twok/internal/agent"
@@ -48,7 +49,7 @@ func (m *memberFlags) register(fs *flag.FlagSet) {
 type agentOptions struct {
 	member        memberFlags
 	arbiter       string
-	peerEndpoint  string
+	peerEndpoints []string
 	configDir     string
 	metricsListen string
 	// shared are the shared settings given as flags or through the
@@ -61,7 +62,17 @@ func parseAgentOptions(args []string, e env) (agentOptions, int, bool) {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	opts.member.register(fs)
 	fs.StringVar(&opts.arbiter, "arbiter", "", "the arbiter URL, see docs/design.md")
-	fs.StringVar(&opts.peerEndpoint, "peer-endpoint", "", "client URL of the other member, for a rejoin when the member list does not tell")
+	peerEndpoints := func(value string) error {
+		for ep := range strings.SplitSeq(value, ",") {
+			if ep = strings.TrimSpace(ep); ep != "" {
+				opts.peerEndpoints = append(opts.peerEndpoints, ep)
+			}
+		}
+		return nil
+	}
+	fs.Func("peer-endpoints", "comma-separated client URLs that lead to the other member, for a rejoin when the member list does not tell;"+
+		" a host may be a name that resolves to both members, such as a headless Service", peerEndpoints)
+	fs.Func("peer-endpoint", "the same as --peer-endpoints, kept for compatibility", peerEndpoints)
 	fs.StringVar(&opts.configDir, "config-dir", "", "directory of the mounted twok ConfigMap, read again before every poll")
 	fs.StringVar(&opts.metricsListen, "metrics-listen", "", "address for the Prometheus endpoint; empty disables it")
 	defaults := config.Default()
@@ -132,7 +143,7 @@ func startAgent(ctx context.Context, opts agentOptions, logger *slog.Logger) err
 	if err != nil {
 		return err
 	}
-	local, err := dialMember(opts.member.endpoint, opts.member.tls)
+	local, err := dialMember(opts.member.endpoint, "", opts.member.tls)
 	if err != nil {
 		return err
 	}
@@ -145,15 +156,17 @@ func startAgent(ctx context.Context, opts agentOptions, logger *slog.Logger) err
 	// that nothing happens before the configuration is read.
 	initial := config.Default()
 	a := agent.New(agent.Options{
-		Config:        initial,
-		Load:          opts.load,
-		Local:         local,
-		Dial:          func(endpoint string) (agent.Client, error) { return dialMember(endpoint, opts.member.tls) },
+		Config: initial,
+		Load:   opts.load,
+		Local:  local,
+		Dial: func(endpoint, serverName string) (agent.Client, error) {
+			return dialMember(endpoint, serverName, opts.member.tls)
+		},
 		Arbiter:       arb,
 		WAL:           wal,
 		Process:       agent.NewProcProcess(opts.member.dataDir, logger),
 		DataDir:       opts.member.dataDir,
-		PeerEndpoint:  opts.peerEndpoint,
+		PeerEndpoints: opts.peerEndpoints,
 		MetricsListen: opts.metricsListen,
 		Logger:        logger,
 	})

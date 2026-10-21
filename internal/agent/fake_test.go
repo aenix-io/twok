@@ -244,6 +244,14 @@ func (p *fakeProcess) Resume(context.Context) error {
 	return nil
 }
 
+// identityResolver resolves every name to itself, so that the fakes'
+// endpoints are dialed as written.
+type identityResolver struct{}
+
+func (identityResolver) LookupHost(_ context.Context, host string) ([]string, error) {
+	return []string{host}, nil
+}
+
 // syncBuffer is a log destination safe for the watchdog goroutine.
 type syncBuffer struct {
 	mu  sync.Mutex
@@ -307,16 +315,17 @@ func (a *flakyArbiter) Verify(ctx context.Context) error {
 }
 
 type harness struct {
-	t      *testing.T
-	agent  *Agent
-	local  *fakeMember
-	peer   *fakeMember
-	wal    *fakeWAL
-	proc   *fakeProcess
-	arb    *flakyArbiter
-	logs   *syncBuffer
-	now    time.Time
-	dialed []string
+	t           *testing.T
+	agent       *Agent
+	local       *fakeMember
+	peer        *fakeMember
+	wal         *fakeWAL
+	proc        *fakeProcess
+	arb         *flakyArbiter
+	logs        *syncBuffer
+	now         time.Time
+	dialed      []string
+	serverNames []string
 }
 
 func fastConfig(mode config.Mode) config.Config {
@@ -350,10 +359,12 @@ func newHarness(t *testing.T, cfg config.Config) *harness {
 		now:  time.Date(2026, 10, 21, 20, 0, 0, 0, time.UTC),
 	}
 	h.agent = New(Options{
-		Config: cfg,
-		Local:  local,
-		Dial: func(endpoint string) (Client, error) {
+		Resolver: identityResolver{},
+		Config:   cfg,
+		Local:    local,
+		Dial: func(endpoint, serverName string) (Client, error) {
 			h.dialed = append(h.dialed, endpoint)
+			h.serverNames = append(h.serverNames, serverName)
 			if endpoint == peer.endpoint {
 				return peer, nil
 			}

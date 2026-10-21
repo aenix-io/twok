@@ -9,8 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,9 +75,12 @@ type Options struct {
 	Process Process
 	// DataDir is the member's data directory as twok sees it.
 	DataDir string
-	// PeerEndpoint is the other member's client URL, for a rejoin when
-	// the member list does not tell.
-	PeerEndpoint  string
+	// PeerEndpoints lead to the other member's client API, for a rejoin
+	// when the member list does not tell where the survivor is. A host
+	// may resolve to several addresses, the local member's among them.
+	PeerEndpoints []string
+	// Resolver resolves their hosts; nil means net.DefaultResolver.
+	Resolver      Resolver
 	MetricsListen string
 	Logger        *slog.Logger
 	// Now is time.Now outside tests.
@@ -91,7 +97,8 @@ type Agent struct {
 	wal           WAL
 	proc          Process
 	dataDir       string
-	peerEndpoint  string
+	peerEndpoints []string
+	resolver      Resolver
 	metricsListen string
 	logger        *slog.Logger
 	now           func() time.Time
@@ -129,6 +136,9 @@ func New(o Options) *Agent {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
+	if o.Resolver == nil {
+		o.Resolver = net.DefaultResolver
+	}
 	a := &Agent{
 		cfg:            o.Config,
 		load:           o.Load,
@@ -138,7 +148,8 @@ func New(o Options) *Agent {
 		wal:            o.WAL,
 		proc:           o.Process,
 		dataDir:        o.DataDir,
-		peerEndpoint:   o.PeerEndpoint,
+		peerEndpoints:  o.PeerEndpoints,
+		resolver:       o.Resolver,
 		metricsListen:  o.MetricsListen,
 		logger:         o.Logger,
 		now:            o.Now,
@@ -167,7 +178,7 @@ func (a *Agent) engineParams() engine.Params {
 	p.ClaimAfter = a.cfg.ClaimAfter
 	p.ClaimDelay = a.cfg.ClaimDelay
 	p.FollowerExtraDelay = a.cfg.FollowerExtraDelay
-	p.PeerEndpoint = a.peerEndpoint
+	p.PeerEndpoints = slices.Clone(a.peerEndpoints)
 	p.Version = version.Version
 	return p
 }
@@ -402,7 +413,7 @@ func (a *Agent) learnerStatus(ctx context.Context, learners []engine.Member) map
 	out := map[uint64]engine.Status{}
 	for _, l := range learners {
 		for _, u := range l.ClientURLs {
-			c, err := a.peer(u)
+			c, err := a.peer(u, "")
 			if err != nil {
 				continue
 			}
@@ -667,15 +678,75 @@ func (a *Agent) confirmLearner(ctx context.Context, survivor Client, learner uin
 	return fmt.Errorf("the survivor %s does not list learner %s with peer URLs %v", survivor.Endpoint(), engine.Hex(learner), peerURLs)
 }
 
-// findSurvivor returns a client for the first endpoint that answers as the
-// survivor the arbiter names: the same cluster, the expected member ID, and
-// leading.
+// candidate is one address to try for the survivor.
+type candidate struct {
+	endpoint   string
+	serverName string
+}
+
+// expand turns an endpoint into the addresses to try: an endpoint whose
+// host is a name becomes one candidate per address the name resolves to
+// now, with the URL's scheme and port, and the name kept for verifying the
+// certificate. A headless Service's name resolves to every member, the
+// local one included, so a name given once covers both members wherever
+// they run.
+func (a *Agent) expand(ctx context.Context, ep string) ([]candidate, error) {
+	u, err := url.Parse(ep)
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("endpoint %q is not a URL", ep)
+	}
+	host, port := u.Hostname(), u.Port()
+	if net.ParseIP(host) != nil {
+		return []candidate{{endpoint: ep}}, nil
+	}
+	rctx, cancel := context.WithTimeout(ctx, a.pollTimeout)
+	addrs, err := a.resolver.LookupHost(rctx, host)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", host, err)
+	}
+	out := make([]candidate, 0, len(addrs))
+	for _, addr := range addrs {
+		v := *u
+		switch {
+		case port != "":
+			v.Host = net.JoinHostPort(addr, port)
+		case strings.Contains(addr, ":"):
+			v.Host = "[" + addr + "]"
+		default:
+			v.Host = addr
+		}
+		out = append(out, candidate{endpoint: v.String(), serverName: host})
+	}
+	return out, nil
+}
+
+// findSurvivor returns a client for the first candidate that answers as
+// the survivor the arbiter names: the same cluster, the expected member ID,
+// and leading. Endpoints are tried in order, the last member list's first,
+// and a name is resolved only when the endpoints before it failed. The
+// local member, which a name may resolve to as well, is skipped.
 func (a *Agent) findSurvivor(ctx context.Context, act engine.Action) (Client, error) {
 	var errs []error
 	for _, ep := range act.SurvivorEndpoints {
-		c, err := a.peer(ep)
+		cands, err := a.expand(ctx, ep)
 		if err != nil {
 			errs = append(errs, err)
+			continue
+		}
+		if c := a.trySurvivor(ctx, act, cands, &errs); c != nil {
+			return c, nil
+		}
+	}
+	return nil, fmt.Errorf("no survivor found: %w", errors.Join(errs...))
+}
+
+func (a *Agent) trySurvivor(ctx context.Context, act engine.Action, cands []candidate, errs *[]error) Client {
+	for _, cand := range cands {
+		ep := cand.endpoint
+		c, err := a.peer(ep, cand.serverName)
+		if err != nil {
+			*errs = append(*errs, err)
 			continue
 		}
 		sctx, cancel := context.WithTimeout(ctx, a.pollTimeout)
@@ -683,18 +754,20 @@ func (a *Agent) findSurvivor(ctx context.Context, act engine.Action) (Client, er
 		cancel()
 		switch {
 		case err != nil:
-			errs = append(errs, err)
+			*errs = append(*errs, err)
+		case act.Self != 0 && st.MemberID == act.Self:
+			// The local member, reached through a shared name.
 		case st.ClusterID != act.ClusterID:
-			errs = append(errs, fmt.Errorf("%s belongs to cluster %s, not %s", ep, engine.Hex(st.ClusterID), engine.Hex(act.ClusterID)))
+			*errs = append(*errs, fmt.Errorf("%s belongs to cluster %s, not %s", ep, engine.Hex(st.ClusterID), engine.Hex(act.ClusterID)))
 		case act.SurvivorID != 0 && st.MemberID != act.SurvivorID:
-			errs = append(errs, fmt.Errorf("%s is member %s, the survivor is %s", ep, engine.Hex(st.MemberID), engine.Hex(act.SurvivorID)))
+			*errs = append(*errs, fmt.Errorf("%s is member %s, the survivor is %s", ep, engine.Hex(st.MemberID), engine.Hex(act.SurvivorID)))
 		case st.Leader != st.MemberID:
-			errs = append(errs, fmt.Errorf("%s does not lead", ep))
+			*errs = append(*errs, fmt.Errorf("%s does not lead", ep))
 		default:
-			return c, nil
+			return c
 		}
 	}
-	return nil, fmt.Errorf("no survivor found: %w", errors.Join(errs...))
+	return nil
 }
 
 // withStopped stops etcd, runs op on the stopped member's data and lets
@@ -762,15 +835,16 @@ func (a *Agent) waitForEtcd(ctx context.Context, what string) error {
 	}
 }
 
-func (a *Agent) peer(endpoint string) (Client, error) {
-	if c, ok := a.peers[endpoint]; ok {
+func (a *Agent) peer(endpoint, serverName string) (Client, error) {
+	key := endpoint + " " + serverName
+	if c, ok := a.peers[key]; ok {
 		return c, nil
 	}
-	c, err := a.dial(endpoint)
+	c, err := a.dial(endpoint, serverName)
 	if err != nil {
 		return nil, err
 	}
-	a.peers[endpoint] = c
+	a.peers[key] = c
 	return c, nil
 }
 

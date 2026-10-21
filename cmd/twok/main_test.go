@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -144,9 +145,15 @@ func TestAgentSettings(t *testing.T) {
 		v, ok := map[string]string{"TWOK_ARBITER": "memory://x", "TWOK_CLAIM_DELAY": "7s"}[k]
 		return v, ok
 	}}
-	opts, code, ok := parseAgentOptions([]string{"--data-dir=/var/lib/etcd", "--config-dir=" + dir, "--mode=enforce"}, e)
+	opts, code, ok := parseAgentOptions([]string{
+		"--data-dir=/var/lib/etcd", "--config-dir=" + dir, "--mode=enforce",
+		"--peer-endpoints=https://etcd.ns.svc:2379, https://10.0.0.9:2379", "--peer-endpoint=https://old:2379",
+	}, e)
 	if !ok {
 		t.Fatalf("parse: %d, %s", code, stderr.String())
+	}
+	if want := []string{"https://etcd.ns.svc:2379", "https://10.0.0.9:2379", "https://old:2379"}; !slices.Equal(opts.peerEndpoints, want) {
+		t.Errorf("peer endpoints = %v, want %v", opts.peerEndpoints, want)
 	}
 	if opts.arbiter != "memory://x" || opts.member.endpoint != "https://127.0.0.1:2379" {
 		t.Errorf("options = %+v", opts)

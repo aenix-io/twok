@@ -51,9 +51,10 @@ type Params struct {
 	// promotions of a learner that is not ready.
 	PromoteBackoff    time.Duration
 	MaxPromoteBackoff time.Duration
-	// PeerEndpoint is a client URL of the other member, used for a rejoin
-	// when the member list does not say where the survivor is.
-	PeerEndpoint string
+	// PeerEndpoints are client URLs that lead to the other member, tried
+	// for a rejoin after the URLs of the last member list. A URL's host may
+	// be a name that resolves to both members, which the agent resolves.
+	PeerEndpoints []string
 	// Version goes into the records this member writes.
 	Version string
 }
@@ -607,7 +608,7 @@ func (e *Engine) rejoin(o Observation) Decision {
 	switch {
 	case len(endpoints) == 0:
 		d.Problem = true
-		d.Note = base + ", but no client URL of the survivor is known; set --peer-endpoint"
+		d.Note = base + ", but no client URL of the survivor is known; set --peer-endpoints"
 		return d
 	case len(e.peerURLs) == 0:
 		d.Note = base + ", but the local peer URLs are unknown"
@@ -644,8 +645,10 @@ func (e *Engine) survivorEndpoints(rec arbiter.Record) []string {
 			}
 		}
 	}
-	if e.p.PeerEndpoint != "" && !slices.Contains(endpoints, e.p.PeerEndpoint) {
-		endpoints = append(endpoints, e.p.PeerEndpoint)
+	for _, ep := range e.p.PeerEndpoints {
+		if ep != "" && !slices.Contains(endpoints, ep) {
+			endpoints = append(endpoints, ep)
+		}
 	}
 	return endpoints
 }

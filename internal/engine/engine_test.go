@@ -276,7 +276,7 @@ func TestRemovedBeforeTheArbiterWasRead(t *testing.T) {
 				// generation key nor the member list, only the WAL tells
 				// it who it is, and only the configured peer endpoint
 				// where the survivor is.
-				slow.PeerEndpoint = clientURL("b")
+				slow.PeerEndpoints = []string{clientURL("b")}
 				a.e = New(slow)
 			}
 			expectPairAgain(t, w, 1)

@@ -21,6 +21,9 @@ type EtcdConfig struct {
 	CertFile string
 	KeyFile  string
 	CAFile   string
+	// ServerName overrides the endpoint's host as the name the member's
+	// certificate is verified against.
+	ServerName string
 }
 
 // etcdClient is Client over the member package, with a second connection
@@ -33,7 +36,9 @@ type etcdClient struct {
 
 // NewEtcdClient returns a Client for one member. It does not connect yet.
 func NewEtcdClient(cfg EtcdConfig) (Client, error) {
-	m, err := member.New(member.Config{Endpoint: cfg.Endpoint, CertFile: cfg.CertFile, KeyFile: cfg.KeyFile, CAFile: cfg.CAFile})
+	m, err := member.New(member.Config{
+		Endpoint: cfg.Endpoint, CertFile: cfg.CertFile, KeyFile: cfg.KeyFile, CAFile: cfg.CAFile, ServerName: cfg.ServerName,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +48,7 @@ func NewEtcdClient(cfg EtcdConfig) (Client, error) {
 		Logger:      zap.NewNop(),
 	}
 	if cfg.CAFile != "" || cfg.CertFile != "" {
-		info := transport.TLSInfo{CertFile: cfg.CertFile, KeyFile: cfg.KeyFile, TrustedCAFile: cfg.CAFile}
+		info := transport.TLSInfo{CertFile: cfg.CertFile, KeyFile: cfg.KeyFile, TrustedCAFile: cfg.CAFile, ServerName: cfg.ServerName}
 		tlsCfg, err := info.ClientConfig()
 		if err != nil {
 			_ = m.Close()
