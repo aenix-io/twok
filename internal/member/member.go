@@ -58,6 +58,11 @@ type Config struct {
 	CertFile string
 	KeyFile  string
 	CAFile   string
+	// ServerName is the name the member's certificate is verified
+	// against. Empty means the endpoint's host. It is set when the endpoint
+	// is one address a DNS name resolved to, so that the certificate is
+	// still checked for the name.
+	ServerName string
 	// DialTimeout bounds each connection attempt; zero means
 	// DefaultDialTimeout.
 	DialTimeout time.Duration
@@ -140,7 +145,11 @@ func New(cfg Config) (*Client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("member endpoint %q: %w", cfg.Endpoint, err)
 		}
-		tlsCfg, err := tlsConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, u.Hostname())
+		serverName := cfg.ServerName
+		if serverName == "" {
+			serverName = u.Hostname()
+		}
+		tlsCfg, err := tlsConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, serverName)
 		if err != nil {
 			return nil, fmt.Errorf("member %s: %w", cfg.Endpoint, err)
 		}
